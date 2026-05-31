@@ -11,5 +11,5 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 mb-dom = { path = "../mb-dom" }
 mb-network = { path = "../mb-network" }
-boa_engine = "0.19"
+rquickjs = { version = "0.12", features = ["full"] }
 slotmap = "1.1"

@@ -1,4 +1,4 @@
-//! JavaScript engine implementation using boa_engine
+//! JavaScript engine implementation using rquickjs (QuickJS-NG)
 //!
 //! Provides a JavaScript runtime with basic Web API bindings:
 //! - console.log
@@ -8,7 +8,7 @@
 //! - setTimeout / setInterval / clearTimeout / clearInterval (MVP)
 
 use anyhow::{Result, anyhow};
-use boa_engine::{Context, Source, JsValue, JsString};
+use rquickjs::{Context as QContext, Runtime, Ctx, Value, String as JsString};
 use mb_dom::tree::DomTree;
 use mb_dom::node::{NodeKind, NodeId};
 use slotmap::Key;
@@ -41,20 +41,66 @@ pub struct PendingCallback {
     pub fire_at_ms: u64,
 }
 
-/// JavaScript engine wrapper around boa_engine
+/// JavaScript engine wrapper around rquickjs
 pub struct JsEngine {
-    context: Context,
+    runtime: Runtime,
+    context: QContext,
     pending_callbacks: Vec<PendingCallback>,
     /// Mutations recorded by JS that need to be applied to the Rust DomTree.
     pub mutations: Vec<Mutation>,
 }
 
+/// Convert a rquickjs Value to a String representation
+fn js_value_to_string(val: &Value) -> String {
+    if val.is_null() {
+        "null".to_string()
+    } else if val.is_undefined() {
+        "undefined".to_string()
+    } else if val.is_bool() {
+        val.as_bool().unwrap_or(false).to_string()
+    } else if val.is_int() {
+        val.as_int().unwrap_or(0).to_string()
+    } else if val.is_float() || val.is_number() {
+        val.as_float().unwrap_or(0.0).to_string()
+    } else if val.is_string() {
+        val.as_string().and_then(|s| s.to_string().ok()).unwrap_or_default()
+    } else {
+        format!("{:?}", val)
+    }
+}
+
+/// Extract a number from a Value (handles both Int and Float)
+fn value_to_f64(val: &Value) -> Option<f64> {
+    val.as_float()
+}
+
+/// Extract a u64 from a Value
+fn value_to_u64(val: &Value) -> Option<u64> {
+    val.as_float().map(|f| f as u64)
+}
+
+/// Extract a string from a Value
+fn value_to_string(val: &Value) -> Option<String> {
+    if val.is_string() {
+        val.as_string().and_then(|s| s.to_string().ok())
+    } else {
+        None
+    }
+}
+
+/// Extract a boolean from a Value
+fn value_to_bool(val: &Value) -> Option<bool> {
+    val.as_bool()
+}
+
 impl JsEngine {
     /// Create a new JS engine instance
     pub fn new() -> Self {
-        let context = Context::default();
+        let rt = Runtime::new().unwrap();
+        let ctx = QContext::full(&rt).unwrap();
         Self {
-            context,
+            runtime: rt,
+            context: ctx,
             pending_callbacks: Vec::new(),
             mutations: Vec::new(),
         }
@@ -82,8 +128,10 @@ impl JsEngine {
 
     /// Evaluate JavaScript code and return the result as a string
     pub fn eval(&mut self, code: &str) -> Result<String> {
-        let result = self.context.eval(Source::from_bytes(code))
-            .map_err(|e| anyhow!("JS evaluation error: {:?}", e))?;
+        let result_str = self.context.with(|ctx| -> rquickjs::Result<String> {
+            let val: Value = ctx.eval(code)?;
+            Ok(js_value_to_string(&val))
+        }).map_err(|e| anyhow!("JS evaluation error: {:?}", e))?;
 
         // Drain any DOM mutations that were queued during eval
         if let Err(e) = self.drain_js_mutations() {
@@ -93,7 +141,7 @@ impl JsEngine {
         // Drain and execute pending timer callbacks (up to 5 rounds)
         let _ = self.drain_and_execute_timers();
 
-        Ok(self.js_value_to_string(&result))
+        Ok(result_str)
     }
 
     /// Drain JS-side __mutations__ array and add to self.mutations.
@@ -106,91 +154,91 @@ impl JsEngine {
             return out;
         })()
         "#;
-        let result = self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to drain mutations: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let result: Value = ctx.eval(code)?;
 
-        if let Some(arr) = result.as_object() {
-            let len = arr.get(JsString::from("length"), &mut self.context)
-                .ok()
-                .and_then(|v| v.as_number())
-                .unwrap_or(0.0) as usize;
+            if let Some(arr) = result.as_object() {
+                let len: usize = arr.get::<_, Value>("length")
+                    .ok()
+                    .and_then(|v| value_to_f64(&v))
+                    .unwrap_or(0.0) as usize;
 
-            for i in 0..len {
-                if let Ok(entry) = arr.get(i as f64, &mut self.context) {
-                    if let Some(obj) = entry.as_object() {
-                        let kind = obj
-                            .get(JsString::from("type"), &mut self.context)
-                            .ok()
-                            .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
-                            .unwrap_or_default();
-
-                        let get_num = |ctx: &mut Context, key: &str| -> Option<u64> {
-                            obj.get(JsString::from(key), ctx)
+                for i in 0..len {
+                    if let Ok(entry) = arr.get::<_, Value>(i as u32) {
+                        if let Some(obj) = entry.as_object() {
+                            let kind = obj.get::<_, Value>("type")
                                 .ok()
-                                .and_then(|v| v.as_number())
-                                .map(|n| n as u64)
-                        };
-                        let get_str = |ctx: &mut Context, key: &str| -> String {
-                            obj.get(JsString::from(key), ctx)
-                                .ok()
-                                .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
-                                .unwrap_or_default()
-                        };
+                                .and_then(|v| value_to_string(&v))
+                                .unwrap_or_default();
 
-                        let mutation_kind = match kind.as_str() {
-                            "setAttribute" => {
-                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
-                                let name = get_str(&mut self.context, "name");
-                                let value = get_str(&mut self.context, "value");
-                                if node_id > 0 && !name.is_empty() {
-                                    Some(MutationKind::SetAttribute { node_id, name, value })
-                                } else { None }
-                            }
-                            "removeAttribute" => {
-                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
-                                let name = get_str(&mut self.context, "name");
-                                if node_id > 0 && !name.is_empty() {
-                                    Some(MutationKind::RemoveAttribute { node_id, name })
-                                } else { None }
-                            }
-                            "textContent" => {
-                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
-                                let text = get_str(&mut self.context, "text");
-                                if node_id > 0 {
-                                    Some(MutationKind::SetTextContent { node_id, text })
-                                } else { None }
-                            }
-                            "innerHTML" => {
-                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
-                                let html = get_str(&mut self.context, "html");
-                                if node_id > 0 {
-                                    Some(MutationKind::SetInnerHTML { node_id, html })
-                                } else { None }
-                            }
-                            "appendChild" => {
-                                let parent_id = get_num(&mut self.context, "parentId").unwrap_or(0);
-                                let child_tag = get_str(&mut self.context, "childTag");
-                                if parent_id > 0 {
-                                    Some(MutationKind::AppendChild { parent_id, child_tag })
-                                } else { None }
-                            }
-                            "removeChild" => {
-                                let parent_id = get_num(&mut self.context, "parentId").unwrap_or(0);
-                                let child_id = get_num(&mut self.context, "childId").unwrap_or(0);
-                                if parent_id > 0 && child_id > 0 {
-                                    Some(MutationKind::RemoveChild { parent_id, child_id })
-                                } else { None }
-                            }
-                            _ => None,
-                        };
+                            let get_num = |key: &str| -> Option<u64> {
+                                obj.get::<_, Value>(key)
+                                    .ok()
+                                    .and_then(|v| value_to_u64(&v))
+                            };
+                            let get_str = |key: &str| -> String {
+                                obj.get::<_, Value>(key)
+                                    .ok()
+                                    .and_then(|v| value_to_string(&v))
+                                    .unwrap_or_default()
+                            };
 
-                        if let Some(kind) = mutation_kind {
-                            self.mutations.push(Mutation { kind });
+                            let mutation_kind = match kind.as_str() {
+                                "setAttribute" => {
+                                    let node_id = get_num("nodeId").unwrap_or(0);
+                                    let name = get_str("name");
+                                    let value = get_str("value");
+                                    if node_id > 0 && !name.is_empty() {
+                                        Some(MutationKind::SetAttribute { node_id, name, value })
+                                    } else { None }
+                                }
+                                "removeAttribute" => {
+                                    let node_id = get_num("nodeId").unwrap_or(0);
+                                    let name = get_str("name");
+                                    if node_id > 0 && !name.is_empty() {
+                                        Some(MutationKind::RemoveAttribute { node_id, name })
+                                    } else { None }
+                                }
+                                "textContent" => {
+                                    let node_id = get_num("nodeId").unwrap_or(0);
+                                    let text = get_str("text");
+                                    if node_id > 0 {
+                                        Some(MutationKind::SetTextContent { node_id, text })
+                                    } else { None }
+                                }
+                                "innerHTML" => {
+                                    let node_id = get_num("nodeId").unwrap_or(0);
+                                    let html = get_str("html");
+                                    if node_id > 0 {
+                                        Some(MutationKind::SetInnerHTML { node_id, html })
+                                    } else { None }
+                                }
+                                "appendChild" => {
+                                    let parent_id = get_num("parentId").unwrap_or(0);
+                                    let child_tag = get_str("childTag");
+                                    if parent_id > 0 {
+                                        Some(MutationKind::AppendChild { parent_id, child_tag })
+                                    } else { None }
+                                }
+                                "removeChild" => {
+                                    let parent_id = get_num("parentId").unwrap_or(0);
+                                    let child_id = get_num("childId").unwrap_or(0);
+                                    if parent_id > 0 && child_id > 0 {
+                                        Some(MutationKind::RemoveChild { parent_id, child_id })
+                                    } else { None }
+                                }
+                                _ => None,
+                            };
+
+                            if let Some(kind) = mutation_kind {
+                                self.mutations.push(Mutation { kind });
+                            }
                         }
                     }
                 }
             }
-        }
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to drain mutations: {:?}", e))?;
         Ok(())
     }
 
@@ -199,34 +247,24 @@ impl JsEngine {
         std::mem::take(&mut self.mutations)
     }
 
-    /// Convert a JsValue to a String representation
-    fn js_value_to_string(&self, val: &JsValue) -> String {
-        match val {
-            JsValue::Null => "null".to_string(),
-            JsValue::Undefined => "undefined".to_string(),
-            JsValue::Boolean(b) => b.to_string(),
-            JsValue::Integer(i) => i.to_string(),
-            JsValue::Rational(f) => f.to_string(),
-            JsValue::String(s) => s.to_std_string_escaped(),
-            JsValue::BigInt(b) => format!("{}", b),
-            _ => val.display().to_string(),
-        }
-    }
-
     /// Set a global string variable
     pub fn set_global(&mut self, name: &str, value: &str) -> Result<()> {
         let code = format!("var {} = {:?};", name, value);
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to set global: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code.as_str())?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to set global: {:?}", e))?;
         Ok(())
     }
 
     /// Get a global variable as a string
     pub fn get_global(&mut self, name: &str) -> Result<String> {
         let code = format!("typeof {0} !== 'undefined' ? {0} : undefined", name);
-        let result = self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to get global: {:?}", e))?;
-        Ok(self.js_value_to_string(&result))
+        let result = self.context.with(|ctx| -> rquickjs::Result<String> {
+            let val: Value = ctx.eval(code.as_str())?;
+            Ok(js_value_to_string(&val))
+        }).map_err(|e| anyhow!("Failed to get global: {:?}", e))?;
+        Ok(result)
     }
 
     /// Setup console object with log method
@@ -256,8 +294,10 @@ impl JsEngine {
         };
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup console: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup console: {:?}", e))?;
         Ok(())
     }
 
@@ -271,29 +311,26 @@ impl JsEngine {
             return [];
         })()
         "#;
-        let result = self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to get console output: {:?}", e))?;
-
-        // Try to convert the array result
-        let mut output = Vec::new();
-        if let Some(arr) = result.as_object() {
-            let length = arr.get(JsString::from("length"), &mut self.context)
-                .ok()
-                .and_then(|v| v.as_number())
-                .unwrap_or(0.0) as usize;
-            for i in 0..length {
-                if let Ok(val) = arr.get(i as f64, &mut self.context) {
-                    output.push(self.js_value_to_string(&val));
+        let output = self.context.with(|ctx| -> rquickjs::Result<Vec<String>> {
+            let result: Value = ctx.eval(code)?;
+            let mut output = Vec::new();
+            if let Some(arr) = result.as_object() {
+                let length: usize = arr.get::<_, Value>("length")
+                    .ok()
+                    .and_then(|v| value_to_f64(&v))
+                    .unwrap_or(0.0) as usize;
+                for i in 0..length {
+                    if let Ok(val) = arr.get::<_, Value>(i as u32) {
+                        output.push(js_value_to_string(&val));
+                    }
                 }
             }
-        }
+            Ok(output)
+        }).map_err(|e| anyhow!("Failed to get console output: {:?}", e))?;
         Ok(output)
     }
 
     /// Setup navigator object — set as a true global property.
-    ///
-    /// Uses `globalThis.navigator = {...}` because boa_engine 0.19
-    /// does not persist `var` declarations across eval calls.
     pub fn setup_navigator(&mut self) -> Result<()> {
         let code = r#"
         globalThis.navigator = {
@@ -318,8 +355,10 @@ impl JsEngine {
         globalThis.window = globalThis;
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup navigator: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup navigator: {:?}", e))?;
         Ok(())
     }
 
@@ -338,8 +377,10 @@ impl JsEngine {
         globalThis.window = globalThis;
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup screen: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup screen: {:?}", e))?;
         Ok(())
     }
 
@@ -385,8 +426,10 @@ impl JsEngine {
         globalThis.window = globalThis;
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup chrome: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup chrome: {:?}", e))?;
         Ok(())
     }
 
@@ -426,8 +469,10 @@ impl JsEngine {
         globalThis.window = globalThis;
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup performance: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup performance: {:?}", e))?;
         Ok(())
     }
 
@@ -451,8 +496,10 @@ impl JsEngine {
         globalThis.window = globalThis;
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup misc: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup misc: {:?}", e))?;
         Ok(())
     }
 
@@ -492,8 +539,10 @@ impl JsEngine {
             format_args!("{:?}", hash),
             format_args!("{:?}", origin));
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup location: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code.as_str())?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup location: {:?}", e))?;
         Ok(())
     }
 
@@ -637,7 +686,6 @@ impl JsEngine {
         );
 
         // Object.defineProperty calls for textContent and innerHTML with mutation tracking.
-        // The backing fields _textContent/_innerHTML are initialized in the element literal.
         let mut prop_defs = Vec::new();
         prop_defs.push(format!(
             r#"Object.defineProperty(__dom_elements__[{nid}],'textContent',{{get:function(){{return this._textContent}},set:function(v){{this._textContent=String(v);__mut_set_text__({nid},String(v))}},enumerable:true,configurable:true}})"#,
@@ -705,12 +753,6 @@ impl JsEngine {
     }
 
     /// Inject the DOM tree into the JS environment as a `document` object.
-    ///
-    /// This serializes all elements into a `__dom_elements__` global object,
-    /// and creates a `document` with standard methods (getElementById, querySelector, etc.).
-    ///
-    /// The `document` object is also set as a true global property so that
-    /// both `document.title` and `window.document.title` work.
     pub fn bind_dom(&mut self, dom: &DomTree) -> Result<()> {
         // 0. Setup mutation queue (must be done before elements are created)
         self.setup_mutation_queue()?;
@@ -755,7 +797,6 @@ impl JsEngine {
         // 5. Inject everything into JS
         let mut code = String::new();
         code.push_str(&format!("var __dom_elements__ = {{{}}};\n", elements_js.join(",\n")));
-        // 5b. Inject Object.defineProperty calls for textContent/innerHTML getters/setters
         for def in &prop_defs_js {
             code.push_str(def);
             code.push_str(";\n");
@@ -770,95 +811,9 @@ impl JsEngine {
              return e || null;\n\
              };\n",
         );
-        code.push_str(&format!(r#"globalThis.document = {{
-            _title: {title},
-            nodeType: 9,
-            nodeName: '#document',
-            get title() {{ return this._title; }},
-            set title(v) {{ this._title = String(v); }},
-            get head() {{ return __dom_node_name__(__dom_head_id__); }},
-            get body() {{ return __dom_node_name__(__dom_body_id__); }},
-            cookie: "",
-            getElementById: function(id) {{
-                var nid = __dom_by_id__[id];
-                if (nid === undefined || nid === null) return null;
-                return __dom_elements__[nid] || null;
-            }},
-            getElementsByTagName: function(tag) {{
-                tag = tag.toUpperCase();
-                var result = [];
-                for (var k in __dom_elements__) {{
-                    var e = __dom_elements__[k];
-                    if (e && e.tagName === tag) result.push(e);
-                }}
-                return result;
-            }},
-            getElementsByClassName: function(cls) {{
-                var result = [];
-                for (var k in __dom_elements__) {{
-                    var e = __dom_elements__[k];
-                    if (e && e.className && e.className.split(' ').indexOf(cls) >= 0) result.push(e);
-                }}
-                return result;
-            }},
-            querySelector: function(sel) {{
-                sel = sel.trim();
-                if (sel.charAt(0) === '#') {{
-                    return this.getElementById(sel.substring(1));
-                }}
-                if (sel.charAt(0) === '.') {{
-                    var cls = sel.substring(1);
-                    var arr = this.getElementsByClassName(cls);
-                    return arr.length > 0 ? arr[0] : null;
-                }}
-                var arr = this.getElementsByTagName(sel);
-                return arr.length > 0 ? arr[0] : null;
-            }},
-            querySelectorAll: function(sel) {{
-                sel = sel.trim();
-                if (sel.charAt(0) === '#') {{
-                    var e = this.getElementById(sel.substring(1));
-                    return e ? [e] : [];
-                }}
-                if (sel.charAt(0) === '.') {{
-                    return this.getElementsByClassName(sel.substring(1));
-                }}
-                return this.getElementsByTagName(sel);
-            }},
-"#, title = title,
-        ));
-        // createElement is split into a separate push_str to avoid
-        // complex escaping issues inside format!().
-        code.push_str(r#"            createElement: function(tag) {
-                var newId = 'created_' + (++this._createCounter);
-                var el = {
-                    tagName: tag.toUpperCase(),
-                    id: "",
-                    className: "",
-                    textContent: "",
-                    innerHTML: "",
-                    getAttribute: function(n) { return this._attrs[n] || null; },
-                    setAttribute: function(n, v) { this._attrs[n] = String(v); },
-                    hasAttribute: function(n) { return n in this._attrs; },
-                    style: {},
-                    _attrs: {},
-                    children: [],
-                    childNodes: [],
-                    parentNode: null
-                };
-                __dom_elements__[newId] = el;
-                return el;
-            },
-            _createCounter: 0
-            };
-"#);
 
-        // Set window alias so `window.xxx` works.
+        // Set window alias
         code.push_str("globalThis.window = globalThis;\n");
-
-        // IMPORTANT: Split into two evals so that document/window are always
-        // created even if the DOM element serialization has syntax errors
-        // (e.g. from ES2015+ inline scripts that boa_engine can't parse).
 
         // Eval 1: document + window globals (must succeed)
         let doc_code = format!(
@@ -933,12 +888,19 @@ globalThis.document = {{
 "#,
             title = title,
         );
-        if let Err(e) = self.context.eval(Source::from_bytes(doc_code.as_bytes())) {
+
+        if let Err(e) = self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(doc_code.as_str())?;
+            Ok(())
+        }) {
             eprintln!("[bind_dom] CRITICAL: document setup failed: {:?}", e);
         }
 
         // Eval 2: DOM elements (may fail if inline scripts have ES2015+ syntax)
-        if let Err(e) = self.context.eval(Source::from_bytes(code.as_bytes())) {
+        if let Err(e) = self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code.as_str())?;
+            Ok(())
+        }) {
             eprintln!("[bind_dom] DOM elements eval error (continuing anyway): {:?}", e);
         }
 
@@ -950,9 +912,6 @@ globalThis.document = {{
     // ------------------------------------------------------------------
 
     /// Inject the JS-side __mutations__ array and helper functions.
-    ///
-    /// This must be called before bind_dom so that the mutation helpers
-    /// are available when element prototypes are set up.
     pub fn setup_mutation_queue(&mut self) -> Result<()> {
         let code = r#"
         var __mutations__ = [];
@@ -976,8 +935,10 @@ globalThis.document = {{
             __mutations__.push({type: 'removeChild', parentId: parentId, childId: childId});
         }
         "#;
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup mutation queue: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup mutation queue: {:?}", e))?;
         Ok(())
     }
 
@@ -985,15 +946,7 @@ globalThis.document = {{
     // Timer infrastructure (MVP)
     // ------------------------------------------------------------------
 
-    /// Register the global setTimeout / setInterval / clearTimeout /
-    /// clearInterval functions.
-    ///
-    /// Callbacks are accumulated in a JS-side `__pending_callbacks__`
-    /// array that can be drained from Rust via [`drain_callbacks`].
-    ///
-    /// Uses `globalThis.xxx = ...` instead of `var` / `function`
-    /// declarations because boa_engine 0.19 does not persist
-    /// eval-local bindings across separate eval calls.
+    /// Register the global setTimeout / setInterval / clearTimeout / clearInterval functions.
     pub fn setup_timers(&mut self) -> Result<()> {
         let code = r#"
         (function() {
@@ -1061,25 +1014,14 @@ globalThis.document = {{
         })();
         "#;
 
-        self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to setup timers: {:?}", e))?;
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup timers: {:?}", e))?;
         Ok(())
     }
 
-    /// Drain pending timer callbacks from the JS side and return them
-    /// as Rust-side metadata.
-    ///
-    /// Each entry contains the timer id, delay, repeating flag, and a
-    /// fire-at timestamp (currently set to 0 — the caller can compute
-    /// the actual deadline from `delay_ms` and `std::time::Instant`).
-    ///
-    /// After draining, the JS-side `__pending_callbacks__` array is
-    /// cleared so the same callbacks are not returned twice.
-    ///
-    /// **MVP note:** The actual JS callback *function* stays on the JS
-    /// side; only metadata is returned.  A future iteration can store
-    /// `JsValue` references in `PendingCallback` and fire them
-    /// synchronously from Rust.
+    /// Drain pending timer callbacks from the JS side and return them as Rust-side metadata.
     pub fn drain_callbacks(&mut self) -> Result<Vec<PendingCallback>> {
         let code = r#"
         (function() {
@@ -1088,55 +1030,49 @@ globalThis.document = {{
         })()
         "#;
 
-        let result = self.context.eval(Source::from_bytes(code.as_bytes()))
-            .map_err(|e| anyhow!("Failed to drain callbacks: {:?}", e))?;
+        let callbacks = self.context.with(|ctx| -> rquickjs::Result<Vec<PendingCallback>> {
+            let result: Value = ctx.eval(code)?;
+            let mut callbacks = Vec::new();
+            if let Some(arr) = result.as_object() {
+                let len: usize = arr.get::<_, Value>("length")
+                    .ok()
+                    .and_then(|v| value_to_f64(&v))
+                    .unwrap_or(0.0) as usize;
 
-        let mut callbacks = Vec::new();
-        if let Some(arr) = result.as_object() {
-            let len = arr.get(JsString::from("length"), &mut self.context)
-                .ok()
-                .and_then(|v| v.as_number())
-                .unwrap_or(0.0) as usize;
+                for i in 0..len {
+                    if let Ok(entry) = arr.get::<_, Value>(i as u32) {
+                        if let Some(obj) = entry.as_object() {
+                            let timer_id = obj.get::<_, Value>("timer_id")
+                                .ok()
+                                .and_then(|v| value_to_f64(&v))
+                                .unwrap_or(0.0) as u32;
 
-            for i in 0..len {
-                if let Ok(entry) = arr.get(i as f64, &mut self.context) {
-                    if let Some(obj) = entry.as_object() {
-                        let timer_id = obj
-                            .get(JsString::from("timer_id"), &mut self.context)
-                            .ok()
-                            .and_then(|v| v.as_number())
-                            .unwrap_or(0.0) as u32;
+                            let delay_ms = obj.get::<_, Value>("delay_ms")
+                                .ok()
+                                .and_then(|v| value_to_f64(&v))
+                                .unwrap_or(0.0) as u32;
 
-                        let delay_ms = obj
-                            .get(JsString::from("delay_ms"), &mut self.context)
-                            .ok()
-                            .and_then(|v| v.as_number())
-                            .unwrap_or(0.0) as u32;
+                            let repeating = obj.get::<_, Value>("repeating")
+                                .ok()
+                                .and_then(|v| value_to_bool(&v))
+                                .unwrap_or(false);
 
-                        let repeating = obj
-                            .get(JsString::from("repeating"), &mut self.context)
-                            .ok()
-                            .and_then(|v| v.as_boolean())
-                            .unwrap_or(false);
-
-                        callbacks.push(PendingCallback {
-                            timer_id,
-                            delay_ms,
-                            repeating,
-                            fire_at_ms: 0, // Caller can compute actual deadline
-                        });
+                            callbacks.push(PendingCallback {
+                                timer_id,
+                                delay_ms,
+                                repeating,
+                                fire_at_ms: 0,
+                            });
+                        }
                     }
                 }
             }
-        }
+            Ok(callbacks)
+        }).map_err(|e| anyhow!("Failed to drain callbacks: {:?}", e))?;
         Ok(callbacks)
     }
 
     /// Drain and execute pending timer callbacks, up to 5 rounds.
-    ///
-    /// This fires callbacks that were registered via setTimeout/setInterval.
-    /// For repeating callbacks (setInterval), they are re-queued after execution.
-    /// The 5-round limit prevents infinite loops from self-scheduling timers.
     pub fn drain_and_execute_timers(&mut self) -> Result<()> {
         for _round in 0..5u32 {
             let code = r#"
@@ -1146,10 +1082,11 @@ globalThis.document = {{
             })()
             "#;
 
-            let result = self.context.eval(Source::from_bytes(code.as_bytes()))
-                .map_err(|e| anyhow!("Failed to execute timer callbacks: {:?}", e))?;
+            let count = self.context.with(|ctx| -> rquickjs::Result<u32> {
+                let result: Value = ctx.eval(code)?;
+                Ok(result.as_float().unwrap_or(0.0) as u32)
+            }).map_err(|e| anyhow!("Failed to execute timer callbacks: {:?}", e))?;
 
-            let count = result.as_number().unwrap_or(0.0) as u32;
             if count == 0 {
                 break;
             }
@@ -1160,7 +1097,7 @@ globalThis.document = {{
     /// Setup XMLHttpRequest support with the given HTTP client
     pub fn setup_xhr(&mut self, client: std::sync::Arc<mb_network::client::HttpClient>) -> Result<()> {
         let handle = tokio::runtime::Handle::current();
-        xhr::register_xhr(&mut self.context, client, handle)
+        xhr::register_xhr(&self.context, client, handle)
     }
 }
 
@@ -1258,8 +1195,6 @@ mod tests {
     fn test_drain_callbacks() {
         let mut engine = JsEngine::new_with_defaults();
         engine.eval("setTimeout(function(){}, 100)").unwrap();
-        // eval() auto-drains and executes callbacks
-        // setInterval re-queues itself (that's the correct behavior)
         let cb = engine.drain_callbacks().unwrap();
         assert_eq!(cb.len(), 0, "All pending callbacks should be drained");
     }
