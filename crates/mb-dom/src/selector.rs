@@ -37,9 +37,9 @@ impl SimpleSelector {
             _ => return false,
         };
 
-        // Tag
+        // Tag (case-insensitive — DOM stores uppercase, selectors use lowercase)
         if let Some(ref tag) = self.tag {
-            if el.tag_name != *tag {
+            if !el.tag_name.eq_ignore_ascii_case(tag) {
                 return false;
             }
         }
@@ -251,32 +251,16 @@ fn parse_single_selector(input: &str) -> Selector {
                 current.tag = Some(t.to_ascii_uppercase());
             }
             SelToken::Id(id) => {
-                if !is_default(&current) {
-                    parts.push((current, pending_combinator.take()));
-                    current = SimpleSelector::default();
-                }
                 current.id = Some(id);
             }
             SelToken::Class(cls) => {
-                if !is_default(&current) {
-                    parts.push((current, pending_combinator.take()));
-                    current = SimpleSelector::default();
-                }
                 current.classes.push(cls);
             }
             SelToken::Attr(name, val) => {
-                if !is_default(&current) {
-                    parts.push((current, pending_combinator.take()));
-                    current = SimpleSelector::default();
-                }
                 current.attr_name = Some(name);
                 current.attr_value = val;
             }
             SelToken::Pseudo(pseudo) => {
-                if !is_default(&current) {
-                    parts.push((current, pending_combinator.take()));
-                    current = SimpleSelector::default();
-                }
                 match pseudo.as_str() {
                     "first-child" => current.first_child = true,
                     "last-child" => current.last_child = true,

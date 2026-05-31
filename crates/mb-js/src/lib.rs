@@ -8,12 +8,22 @@
 //! - setTimeout / setInterval / clearTimeout / clearInterval (MVP)
 
 use anyhow::{Result, anyhow};
-use rquickjs::{Context as QContext, Runtime, Ctx, Value, String as JsString};
+use rquickjs::{Context as QContext, Runtime, Ctx, Value, String as JsString, Function};
+use rquickjs::function::Rest;
 use mb_dom::tree::DomTree;
 use mb_dom::node::{NodeKind, NodeId};
+use mb_dom::selector::SelectorEngine;
 use slotmap::Key;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub mod xhr;
+
+/// Thread-local storage for DOM element data (used by native querySelectorAll)
+/// Maps node_id (u64) -> (tag_name_uppercase, class_list, id_attr, parent_id)
+thread_local! {
+    static DOM_ELEMENTS: RefCell<HashMap<u64, (String, Vec<String>, String, Option<u64>)>> = RefCell::new(HashMap::new());
+}
 
 /// A mutation that was performed on the JS side and needs to be applied to the Rust DomTree.
 #[derive(Debug, Clone)]
@@ -757,17 +767,28 @@ impl JsEngine {
         // 0. Setup mutation queue (must be done before elements are created)
         self.setup_mutation_queue()?;
 
-        // 1. Serialize all element nodes
+        // 1. Serialize all element nodes and populate DOM_ELEMENTS for native selectors
         let mut elements_js = Vec::new();
         let mut prop_defs_js = Vec::new();
+        DOM_ELEMENTS.with(|de| { de.borrow_mut().clear(); });
         for (node_id, node) in dom.nodes.iter() {
-            if let NodeKind::Element(_) = &node.kind {
+            if let NodeKind::Element(el) = &node.kind {
                 let key = node_id.data().as_ffi();
                 let (serialized, prop_defs) = Self::serialize_element(dom, node_id);
                 elements_js.push(format!("{}:{}", key, serialized));
                 for def in prop_defs {
                     prop_defs_js.push(def);
                 }
+                // Store element data for native querySelectorAll
+                let parent_id = node.parent.map(|p| p.data().as_ffi());
+                DOM_ELEMENTS.with(|de| {
+                    de.borrow_mut().insert(key, (
+                        el.tag_name.clone(),
+                        el.class_list.clone(),
+                        el.attributes.get_value("id").unwrap_or("").to_string(),
+                        parent_id,
+                    ));
+                });
             }
         }
 
@@ -856,6 +877,11 @@ globalThis.document = {{
     }},
     querySelector: function(sel) {{
         sel = sel.trim();
+        if (typeof _dom_query_selector_all === 'function') {{
+            var ids = _dom_query_selector_all(sel);
+            if (ids.length > 0) return __dom_elements__[ids[0]] || null;
+        }}
+        // Fallback for simple selectors
         if (sel.charAt(0) === '#') {{ return this.getElementById(sel.substring(1)); }}
         if (sel.charAt(0) === '.') {{
             var arr = this.getElementsByClassName(sel.substring(1));
@@ -866,6 +892,16 @@ globalThis.document = {{
     }},
     querySelectorAll: function(sel) {{
         sel = sel.trim();
+        if (typeof _dom_query_selector_all === 'function') {{
+            var ids = _dom_query_selector_all(sel);
+            var result = [];
+            for (var i = 0; i < ids.length; i++) {{
+                var el = __dom_elements__[ids[i]];
+                if (el) result.push(el);
+            }}
+            return result;
+        }}
+        // Fallback for simple selectors
         if (sel.charAt(0) === '#') {{ var e = this.getElementById(sel.substring(1)); return e ? [e] : []; }}
         if (sel.charAt(0) === '.') {{ return this.getElementsByClassName(sel.substring(1)); }}
         return this.getElementsByTagName(sel);
@@ -888,6 +924,97 @@ globalThis.document = {{
 "#,
             title = title,
         );
+
+        // Register native querySelectorAll function
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let func = Function::new(ctx.clone(), |args: Rest<Value>| -> rquickjs::Result<Vec<u64>> {
+                let selector = args.get(0)
+                    .and_then(|v| v.as_string())
+                    .and_then(|s| s.to_string().ok())
+                    .unwrap_or_default();
+                
+                let results: Vec<u64> = DOM_ELEMENTS.with(|de| {
+                    let elements = de.borrow();
+                    // Build a mini DomTree-like structure for selector matching
+                    // For each element, check if it matches the selector
+                    let engine = SelectorEngine::parse(&selector);
+                    elements.iter()
+                        .filter(|(nid, (tag, classes, id, parent))| {
+                            // Check each selector in the engine
+                            engine.selectors.iter().any(|sel| {
+                                if sel.parts.is_empty() { return false; }
+                                // For simple selectors (1 part), just check the last part
+                                if sel.parts.len() == 1 {
+                                    let (ref simple, _) = sel.parts[0];
+                                    // Tag check
+                                    if let Some(ref t) = simple.tag {
+                                        if !tag.eq_ignore_ascii_case(t) { return false; }
+                                    }
+                                    // Class check
+                                    for cls in &simple.classes {
+                                        if !classes.iter().any(|c| c == cls) { return false; }
+                                    }
+                                    // ID check
+                                    if let Some(ref id_match) = simple.id {
+                                        if id != id_match { return false; }
+                                    }
+                                    return true;
+                                }
+                                // For compound selectors (descendant/child), we need ancestor chain
+                                // Simple approach: check if current node matches rightmost part,
+                                // then walk up ancestors checking left parts
+                                let (ref right_simple, _) = sel.parts[sel.parts.len() - 1];
+                                // Check rightmost part against current node
+                                if let Some(ref t) = right_simple.tag {
+                                    if !tag.eq_ignore_ascii_case(t) { return false; }
+                                }
+                                for cls in &right_simple.classes {
+                                    if !classes.iter().any(|c| c == cls) { return false; }
+                                }
+                                if let Some(ref id_match) = right_simple.id {
+                                    if id != id_match { return false; }
+                                }
+                                // Walk up ancestors for remaining parts
+                                let mut current_parent = *parent;
+                                for part_idx in (0..sel.parts.len() - 1).rev() {
+                                    let (ref simple, _) = sel.parts[part_idx];
+                                    let mut found = false;
+                                    let mut ancestor = current_parent;
+                                    while let Some(aid) = ancestor {
+                                        if let Some((atag, aclasses, aid_val, aparent)) = elements.get(&aid) {
+                                            let mut matches = true;
+                                            if let Some(ref t) = simple.tag {
+                                                if !atag.eq_ignore_ascii_case(t) { matches = false; }
+                                            }
+                                            for cls in &simple.classes {
+                                                if !aclasses.iter().any(|c| c == cls) { matches = false; }
+                                            }
+                                            if let Some(ref id_match) = simple.id {
+                                                if aid_val != id_match { matches = false; }
+                                            }
+                                            if matches {
+                                                current_parent = *aparent;
+                                                found = true;
+                                                break;
+                                            }
+                                            ancestor = *aparent;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if !found { return false; }
+                                }
+                                true
+                            })
+                        })
+                        .map(|(nid, _)| *nid)
+                        .collect()
+                });
+                Ok(results)
+            })?;
+            ctx.globals().set("_dom_query_selector_all", func)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to register querySelectorAll: {:?}", e))?;
 
         if let Err(e) = self.context.with(|ctx| -> rquickjs::Result<()> {
             let _: Value = ctx.eval(doc_code.as_str())?;
