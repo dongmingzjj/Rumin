@@ -720,9 +720,9 @@ impl JsEngine {
 
     /// Escape a string for use as a JS object key.
     fn escape_js_key(s: &str) -> String {
-        // Check if it's a valid identifier
+        // Check if it's a valid JS identifier (no hyphens!)
         let valid_id = !s.is_empty() && s.chars().next().unwrap().is_ascii_alphabetic()
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
         if valid_id {
             s.to_string()
         } else {
