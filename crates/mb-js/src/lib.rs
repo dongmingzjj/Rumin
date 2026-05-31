@@ -856,11 +856,90 @@ impl JsEngine {
         // Set window alias so `window.xxx` works.
         code.push_str("globalThis.window = globalThis;\n");
 
-        // Fault-tolerant: if boa_engine cannot parse the generated JS
-        // (e.g. getter/setter syntax not supported), log a warning and
-        // continue instead of crashing the whole page load.
+        // IMPORTANT: Split into two evals so that document/window are always
+        // created even if the DOM element serialization has syntax errors
+        // (e.g. from ES2015+ inline scripts that boa_engine can't parse).
+
+        // Eval 1: document + window globals (must succeed)
+        let doc_code = format!(
+            r#"globalThis.window = globalThis;
+globalThis.document = {{
+    _title: {title},
+    nodeType: 9,
+    nodeName: '#document',
+    get title() {{ return this._title; }},
+    set title(v) {{ this._title = String(v); }},
+    get head() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_head_id__) : null; }},
+    get body() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_body_id__) : null; }},
+    cookie: "",
+    getElementById: function(id) {{
+        if (typeof __dom_by_id__ === 'undefined') return null;
+        var nid = __dom_by_id__[id];
+        if (nid === undefined || nid === null) return null;
+        return (typeof __dom_elements__ !== 'undefined') ? (__dom_elements__[nid] || null) : null;
+    }},
+    getElementsByTagName: function(tag) {{
+        tag = tag.toUpperCase();
+        var result = [];
+        if (typeof __dom_elements__ !== 'undefined') {{
+            for (var k in __dom_elements__) {{
+                var e = __dom_elements__[k];
+                if (e && e.tagName === tag) result.push(e);
+            }}
+        }}
+        return result;
+    }},
+    getElementsByClassName: function(cls) {{
+        var result = [];
+        if (typeof __dom_elements__ !== 'undefined') {{
+            for (var k in __dom_elements__) {{
+                var e = __dom_elements__[k];
+                if (e && e.className && e.className.split(' ').indexOf(cls) >= 0) result.push(e);
+            }}
+        }}
+        return result;
+    }},
+    querySelector: function(sel) {{
+        sel = sel.trim();
+        if (sel.charAt(0) === '#') {{ return this.getElementById(sel.substring(1)); }}
+        if (sel.charAt(0) === '.') {{
+            var arr = this.getElementsByClassName(sel.substring(1));
+            return arr.length > 0 ? arr[0] : null;
+        }}
+        var arr = this.getElementsByTagName(sel);
+        return arr.length > 0 ? arr[0] : null;
+    }},
+    querySelectorAll: function(sel) {{
+        sel = sel.trim();
+        if (sel.charAt(0) === '#') {{ var e = this.getElementById(sel.substring(1)); return e ? [e] : []; }}
+        if (sel.charAt(0) === '.') {{ return this.getElementsByClassName(sel.substring(1)); }}
+        return this.getElementsByTagName(sel);
+    }},
+    createElement: function(tag) {{
+        var newId = 'created_' + (++this._createCounter);
+        var el = {{
+            tagName: tag.toUpperCase(), id: "", className: "", textContent: "", innerHTML: "",
+            _attrs: {{}}, children: [], childNodes: [], parentNode: null,
+            getAttribute: function(n) {{ return this._attrs[n] || null; }},
+            setAttribute: function(n, v) {{ this._attrs[n] = String(v); }},
+            hasAttribute: function(n) {{ return n in this._attrs; }},
+            style: {{}}
+        }};
+        if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = el;
+        return el;
+    }},
+    _createCounter: 0
+}};
+"#,
+            title = title,
+        );
+        if let Err(e) = self.context.eval(Source::from_bytes(doc_code.as_bytes())) {
+            eprintln!("[bind_dom] CRITICAL: document setup failed: {:?}", e);
+        }
+
+        // Eval 2: DOM elements (may fail if inline scripts have ES2015+ syntax)
         if let Err(e) = self.context.eval(Source::from_bytes(code.as_bytes())) {
-            eprintln!("[bind_dom] JS eval error (continuing anyway): {:?}", e);
+            eprintln!("[bind_dom] DOM elements eval error (continuing anyway): {:?}", e);
         }
 
         Ok(())
