@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
 
 use mb_dom::tree::DomTree;
+use mb_dom::node::{NodeId, NodeKind};
 use mb_html::parser::HtmlParser;
-use mb_js::JsEngine;
+use mb_js::{JsEngine, Mutation, MutationKind};
 use mb_network::client::HttpClient;
 use mb_network::cookie::CookieJar;
 
@@ -95,7 +96,121 @@ impl Page {
 
     /// Execute JavaScript in the page context
     pub fn eval(&mut self, code: &str) -> Result<String> {
-        self.js.eval(code)
+        let result = self.js.eval(code)?;
+
+        // Apply mutations from JS back to the DomTree
+        let mutations = self.js.drain_mutations();
+        for m in mutations {
+            if let Err(e) = self.apply_mutation(m) {
+                tracing::warn!("Failed to apply mutation: {}", e);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Apply a single JS mutation to the DomTree.
+    fn apply_mutation(&mut self, m: Mutation) -> Result<()> {
+        match m.kind {
+            MutationKind::SetAttribute { node_id, name, value } => {
+                let nid = NodeId::from(slotmap::KeyData::from_ffi(node_id));
+                if self.dom.nodes.contains_key(nid) {
+                    if let Some(el) = self.dom.get_node_mut(nid).kind.as_element_mut() {
+                        el.attributes.set(name, value);
+                    }
+                }
+            }
+            MutationKind::RemoveAttribute { node_id, name } => {
+                let nid = NodeId::from(slotmap::KeyData::from_ffi(node_id));
+                if self.dom.nodes.contains_key(nid) {
+                    if let Some(el) = self.dom.get_node_mut(nid).kind.as_element_mut() {
+                        el.attributes.remove(&name);
+                    }
+                }
+            }
+            MutationKind::SetTextContent { node_id, text } => {
+                let nid = NodeId::from(slotmap::KeyData::from_ffi(node_id));
+                if self.dom.nodes.contains_key(nid) {
+                    // Remove all existing children
+                    let children = self.dom.children(nid);
+                    for child in children {
+                        self.dom.remove_child(nid, child);
+                    }
+                    // Add a new text node as child
+                    let text_id = self.dom.create_text(&text);
+                    self.dom.append_child(nid, text_id);
+                }
+            }
+            MutationKind::SetInnerHTML { node_id, html } => {
+                let nid = NodeId::from(slotmap::KeyData::from_ffi(node_id));
+                if self.dom.nodes.contains_key(nid) {
+                    // Remove all existing children
+                    let children = self.dom.children(nid);
+                    for child in children {
+                        self.dom.remove_child(nid, child);
+                    }
+                    // Parse the HTML and append as children
+                    if !html.is_empty() {
+                        let fragment = mb_html::parser::HtmlParser::parse(&format!("<body>{}</body>", html), &self.url)
+                            .unwrap_or_else(|_| DomTree::new());
+                        // The fragment's body_node children become our children
+                        let frag_body = fragment.body_node;
+                        let frag_children = fragment.children(frag_body);
+                        for fc in frag_children {
+                            // Deep copy the fragment node into our DOM
+                            let copied = self.deep_copy_node(&fragment, fc);
+                            self.dom.append_child(nid, copied);
+                        }
+                    }
+                }
+            }
+            MutationKind::AppendChild { parent_id, child_tag } => {
+                let pid = NodeId::from(slotmap::KeyData::from_ffi(parent_id));
+                if self.dom.nodes.contains_key(pid) {
+                    let child_id = self.dom.create_element(&child_tag);
+                    self.dom.append_child(pid, child_id);
+                }
+            }
+            MutationKind::RemoveChild { parent_id, child_id } => {
+                let pid = NodeId::from(slotmap::KeyData::from_ffi(parent_id));
+                let cid = NodeId::from(slotmap::KeyData::from_ffi(child_id));
+                if self.dom.nodes.contains_key(pid) && self.dom.nodes.contains_key(cid) {
+                    self.dom.remove_child(pid, cid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deep copy a node and its subtree from another DomTree into this one.
+    fn deep_copy_node(&mut self, src: &DomTree, src_id: NodeId) -> NodeId {
+        let src_node = src.get_node(src_id);
+        let new_id = match &src_node.kind {
+            NodeKind::Element(el) => {
+                let new_el = el.clone();
+                let id = self.dom.create_node(NodeKind::Element(new_el));
+                id
+            }
+            NodeKind::Text(t) => {
+                let id = self.dom.create_text(&t.data);
+                id
+            }
+            NodeKind::Comment(c) => {
+                let id = self.dom.create_comment(&c.data);
+                id
+            }
+            NodeKind::Document(_) => return self.dom.create_node(NodeKind::Document(Default::default())),
+        };
+
+        // Copy children
+        let mut src_child = src_node.first_child;
+        while let Some(cid) = src_child {
+            let copied_child = self.deep_copy_node(src, cid);
+            self.dom.append_child(new_id, copied_child);
+            src_child = src.get_node(cid).next_sibling;
+        }
+
+        new_id
     }
 
     /// Get the page title from the DOM

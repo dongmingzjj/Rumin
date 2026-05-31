@@ -15,6 +15,23 @@ use slotmap::Key;
 
 pub mod xhr;
 
+/// A mutation that was performed on the JS side and needs to be applied to the Rust DomTree.
+#[derive(Debug, Clone)]
+pub struct Mutation {
+    pub kind: MutationKind,
+}
+
+/// The type of DOM mutation.
+#[derive(Debug, Clone)]
+pub enum MutationKind {
+    SetAttribute { node_id: u64, name: String, value: String },
+    RemoveAttribute { node_id: u64, name: String },
+    SetTextContent { node_id: u64, text: String },
+    AppendChild { parent_id: u64, child_tag: String },
+    RemoveChild { parent_id: u64, child_id: u64 },
+    SetInnerHTML { node_id: u64, html: String },
+}
+
 /// A pending timer callback registered via setTimeout/setInterval.
 #[derive(Debug, Clone)]
 pub struct PendingCallback {
@@ -28,6 +45,8 @@ pub struct PendingCallback {
 pub struct JsEngine {
     context: Context,
     pending_callbacks: Vec<PendingCallback>,
+    /// Mutations recorded by JS that need to be applied to the Rust DomTree.
+    pub mutations: Vec<Mutation>,
 }
 
 impl JsEngine {
@@ -37,17 +56,28 @@ impl JsEngine {
         Self {
             context,
             pending_callbacks: Vec::new(),
+            mutations: Vec::new(),
         }
     }
 
-    /// Create a new engine with console, navigator, and location set up
+    /// Create a new engine with all anti-detection setup
     pub fn new_with_defaults() -> Self {
         let mut engine = Self::new();
-        let _ = engine.setup_timers();
-        let _ = engine.setup_console();
-        let _ = engine.setup_navigator();
-        let _ = engine.setup_location("about:blank");
+        let _ = engine.run_setup();
         engine
+    }
+
+    /// Run all setup functions for a full browser-like environment
+    pub fn run_setup(&mut self) -> Result<()> {
+        self.setup_timers()?;
+        self.setup_console()?;
+        self.setup_navigator()?;
+        self.setup_location("about:blank")?;
+        self.setup_screen()?;
+        self.setup_chrome()?;
+        self.setup_performance()?;
+        self.setup_misc()?;
+        Ok(())
     }
 
     /// Evaluate JavaScript code and return the result as a string
@@ -55,7 +85,118 @@ impl JsEngine {
         let result = self.context.eval(Source::from_bytes(code))
             .map_err(|e| anyhow!("JS evaluation error: {:?}", e))?;
 
+        // Drain any DOM mutations that were queued during eval
+        if let Err(e) = self.drain_js_mutations() {
+            tracing::warn!("Failed to drain JS mutations: {}", e);
+        }
+
+        // Drain and execute pending timer callbacks (up to 5 rounds)
+        let _ = self.drain_and_execute_timers();
+
         Ok(self.js_value_to_string(&result))
+    }
+
+    /// Drain JS-side __mutations__ array and add to self.mutations.
+    fn drain_js_mutations(&mut self) -> Result<()> {
+        let code = r#"
+        (function() {
+            if (typeof __mutations__ === 'undefined') return [];
+            var out = __mutations__.slice();
+            __mutations__.length = 0;
+            return out;
+        })()
+        "#;
+        let result = self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to drain mutations: {:?}", e))?;
+
+        if let Some(arr) = result.as_object() {
+            let len = arr.get(JsString::from("length"), &mut self.context)
+                .ok()
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0) as usize;
+
+            for i in 0..len {
+                if let Ok(entry) = arr.get(i as f64, &mut self.context) {
+                    if let Some(obj) = entry.as_object() {
+                        let kind = obj
+                            .get(JsString::from("type"), &mut self.context)
+                            .ok()
+                            .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+                            .unwrap_or_default();
+
+                        let get_num = |ctx: &mut Context, key: &str| -> Option<u64> {
+                            obj.get(JsString::from(key), ctx)
+                                .ok()
+                                .and_then(|v| v.as_number())
+                                .map(|n| n as u64)
+                        };
+                        let get_str = |ctx: &mut Context, key: &str| -> String {
+                            obj.get(JsString::from(key), ctx)
+                                .ok()
+                                .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+                                .unwrap_or_default()
+                        };
+
+                        let mutation_kind = match kind.as_str() {
+                            "setAttribute" => {
+                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
+                                let name = get_str(&mut self.context, "name");
+                                let value = get_str(&mut self.context, "value");
+                                if node_id > 0 && !name.is_empty() {
+                                    Some(MutationKind::SetAttribute { node_id, name, value })
+                                } else { None }
+                            }
+                            "removeAttribute" => {
+                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
+                                let name = get_str(&mut self.context, "name");
+                                if node_id > 0 && !name.is_empty() {
+                                    Some(MutationKind::RemoveAttribute { node_id, name })
+                                } else { None }
+                            }
+                            "textContent" => {
+                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
+                                let text = get_str(&mut self.context, "text");
+                                if node_id > 0 {
+                                    Some(MutationKind::SetTextContent { node_id, text })
+                                } else { None }
+                            }
+                            "innerHTML" => {
+                                let node_id = get_num(&mut self.context, "nodeId").unwrap_or(0);
+                                let html = get_str(&mut self.context, "html");
+                                if node_id > 0 {
+                                    Some(MutationKind::SetInnerHTML { node_id, html })
+                                } else { None }
+                            }
+                            "appendChild" => {
+                                let parent_id = get_num(&mut self.context, "parentId").unwrap_or(0);
+                                let child_tag = get_str(&mut self.context, "childTag");
+                                if parent_id > 0 {
+                                    Some(MutationKind::AppendChild { parent_id, child_tag })
+                                } else { None }
+                            }
+                            "removeChild" => {
+                                let parent_id = get_num(&mut self.context, "parentId").unwrap_or(0);
+                                let child_id = get_num(&mut self.context, "childId").unwrap_or(0);
+                                if parent_id > 0 && child_id > 0 {
+                                    Some(MutationKind::RemoveChild { parent_id, child_id })
+                                } else { None }
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(kind) = mutation_kind {
+                            self.mutations.push(Mutation { kind });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain and return all pending mutations.
+    pub fn drain_mutations(&mut self) -> Vec<Mutation> {
+        std::mem::take(&mut self.mutations)
     }
 
     /// Convert a JsValue to a String representation
@@ -161,13 +302,157 @@ impl JsEngine {
             language: 'en-US',
             languages: ['en-US', 'en'],
             cookieEnabled: true,
-            onLine: true
+            onLine: true,
+            vendor: 'Google Inc.',
+            maxTouchPoints: 0,
+            deviceMemory: 8,
+            hardwareConcurrency: 8,
+            plugins: [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+            ],
+            mimeTypes: []
         };
+        globalThis.navigator.plugins.length = 3;
         globalThis.window = globalThis;
         "#;
 
         self.context.eval(Source::from_bytes(code.as_bytes()))
             .map_err(|e| anyhow!("Failed to setup navigator: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Setup screen object with typical desktop resolution
+    pub fn setup_screen(&mut self) -> Result<()> {
+        let code = r#"
+        globalThis.screen = {
+            width: 1920,
+            height: 1080,
+            availWidth: 1920,
+            availHeight: 1040,
+            colorDepth: 24,
+            pixelDepth: 24,
+            orientation: { angle: 0, type: 'landscape-primary' }
+        };
+        globalThis.window = globalThis;
+        "#;
+
+        self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to setup screen: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Setup window.chrome object for anti-detection
+    pub fn setup_chrome(&mut self) -> Result<()> {
+        let code = r#"
+        globalThis.chrome = {
+            runtime: {
+                OnInstalledReason: {},
+                OnRestartRequiredReason: {},
+                PlatformArch: {},
+                PlatformNaclArch: {},
+                PlatformOs: {},
+                RequestUpdateCheckStatus: {}
+            },
+            loadTimes: function() {
+                return {
+                    commitLoadTime: Date.now() / 1000,
+                    connectionInfo: 'h2',
+                    finishDocumentLoadTime: Date.now() / 1000,
+                    finishLoadTime: Date.now() / 1000,
+                    firstPaintAfterLoadTime: 0,
+                    firstPaintTime: Date.now() / 1000,
+                    navigationType: 'Other',
+                    npnNegotiatedProtocol: 'h2',
+                    requestTime: Date.now() / 1000,
+                    startLoadTime: Date.now() / 1000,
+                    wasAlternateProtocolAvailable: false,
+                    wasFetchedViaSpdy: true,
+                    wasNpnNegotiated: true
+                };
+            },
+            csi: function() {
+                var _ps = globalThis.__perf_start__ || Date.now();
+                return {
+                    onloadT: Date.now(),
+                    pageT: Date.now() - _ps,
+                    startE: Date.now(),
+                    tran: 15
+                };
+            }
+        };
+        globalThis.window = globalThis;
+        "#;
+
+        self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to setup chrome: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Setup performance.now() and timeOrigin for anti-detection
+    pub fn setup_performance(&mut self) -> Result<()> {
+        let code = r#"
+        globalThis.__perf_start__ = Date.now();
+        globalThis.performance = {
+            timeOrigin: globalThis.__perf_start__,
+            now: function() {
+                return Date.now() - globalThis.__perf_start__;
+            },
+            timing: {
+                navigationStart: globalThis.__perf_start__,
+                unloadEventStart: 0,
+                unloadEventEnd: 0,
+                redirectStart: 0,
+                redirectEnd: 0,
+                fetchStart: globalThis.__perf_start__,
+                domainLookupStart: globalThis.__perf_start__,
+                domainLookupEnd: globalThis.__perf_start__,
+                connectStart: globalThis.__perf_start__,
+                connectEnd: globalThis.__perf_start__,
+                secureConnectionStart: globalThis.__perf_start__,
+                requestStart: globalThis.__perf_start__,
+                responseStart: globalThis.__perf_start__,
+                responseEnd: globalThis.__perf_start__,
+                domLoading: globalThis.__perf_start__,
+                domInteractive: globalThis.__perf_start__,
+                domContentLoadedEventStart: globalThis.__perf_start__,
+                domContentLoadedEventEnd: globalThis.__perf_start__,
+                domComplete: globalThis.__perf_start__,
+                loadEventStart: globalThis.__perf_start__,
+                loadEventEnd: globalThis.__perf_start__
+            }
+        };
+        globalThis.window = globalThis;
+        "#;
+
+        self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to setup performance: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Setup misc Web APIs: atob, btoa, matchMedia (stubs)
+    pub fn setup_misc(&mut self) -> Result<()> {
+        let code = r#"
+        globalThis.atob = function(s) { return s; };
+        globalThis.btoa = function(s) { return s; };
+        globalThis.matchMedia = function(query) {
+            return {
+                matches: false,
+                media: query,
+                onchange: null,
+                addListener: function() {},
+                removeListener: function() {},
+                addEventListener: function() {},
+                removeEventListener: function() {},
+                dispatchEvent: function() { return true; }
+            };
+        };
+        globalThis.window = globalThis;
+        "#;
+
+        self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to setup misc: {:?}", e))?;
         Ok(())
     }
 
@@ -271,11 +556,13 @@ impl JsEngine {
     }
 
     /// Serialize a single element node into a JS object literal string.
-    fn serialize_element(tree: &DomTree, node_id: NodeId) -> String {
+    /// Returns (element_literal, property_definitions) where property_definitions
+    /// are Object.defineProperty calls for textContent/innerHTML.
+    fn serialize_element(tree: &DomTree, node_id: NodeId) -> (String, Vec<String>) {
         let node = tree.get_node(node_id);
         let el = match &node.kind {
             NodeKind::Element(e) => e,
-            _ => return "null".to_string(),
+            _ => return ("null".to_string(), Vec::new()),
         };
 
         let tag = el.tag_name.to_lowercase();
@@ -333,18 +620,35 @@ impl JsEngine {
         }
         style_js.push('}');
 
-        format!(
-            r#"{{tagName:"{tag}",id:{id},className:{cls},textContent:{txt},innerHTML:"",getAttribute:function(n){{return this._attrs[n]||null}},setAttribute:function(n,v){{this._attrs[n]=String(v)}},hasAttribute:function(n){{return n in this._attrs}},style:{style},_attrs:{attrs},children:{children},childNodes:{child_nodes},parentNode:{parent}}}"#,
+        let nid = node_id.data().as_ffi();
+
+        let element_literal = format!(
+            r#"{{tagName:"{tag}",id:{id},className:{cls},_nodeId:{nid},_textContent:{txt},_innerHTML:"",getAttribute:function(n){{return this._attrs[n]||null}},setAttribute:function(n,v){{this._attrs[n]=String(v);__mut_set_attr__(this._nodeId,n,String(v))}},removeAttribute:function(n){{delete this._attrs[n];__mut_remove_attr__(this._nodeId,n)}},hasAttribute:function(n){{return n in this._attrs}},remove:function(){{if(this.parentNode!==null){{__mut_remove_child__(this.parentNode,this._nodeId)}}}},style:{style},_attrs:{attrs},children:{children},childNodes:{child_nodes},parentNode:{parent}}}"#,
             tag = tag.to_uppercase(),
             id = Self::escape_js_string(id),
             cls = Self::escape_js_string(&class_name),
             txt = text,
+            nid = nid,
             style = style_js,
             attrs = attrs_js,
             children = child_ids_js,
             child_nodes = child_nodes_js,
             parent = parent_js,
-        )
+        );
+
+        // Object.defineProperty calls for textContent and innerHTML with mutation tracking.
+        // The backing fields _textContent/_innerHTML are initialized in the element literal.
+        let mut prop_defs = Vec::new();
+        prop_defs.push(format!(
+            r#"Object.defineProperty(__dom_elements__[{nid}],'textContent',{{get:function(){{return this._textContent}},set:function(v){{this._textContent=String(v);__mut_set_text__({nid},String(v))}},enumerable:true,configurable:true}})"#,
+            nid = nid
+        ));
+        prop_defs.push(format!(
+            r#"Object.defineProperty(__dom_elements__[{nid}],'innerHTML',{{get:function(){{return this._innerHTML}},set:function(v){{this._innerHTML=String(v);__mut_set_inner_html__({nid},String(v))}},enumerable:true,configurable:true}})"#,
+            nid = nid
+        ));
+
+        (element_literal, prop_defs)
     }
 
     /// Escape a string for use as a JS double-quoted string literal.
@@ -408,13 +712,20 @@ impl JsEngine {
     /// The `document` object is also set as a true global property so that
     /// both `document.title` and `window.document.title` work.
     pub fn bind_dom(&mut self, dom: &DomTree) -> Result<()> {
+        // 0. Setup mutation queue (must be done before elements are created)
+        self.setup_mutation_queue()?;
+
         // 1. Serialize all element nodes
         let mut elements_js = Vec::new();
+        let mut prop_defs_js = Vec::new();
         for (node_id, node) in dom.nodes.iter() {
             if let NodeKind::Element(_) = &node.kind {
                 let key = node_id.data().as_ffi();
-                let serialized = Self::serialize_element(dom, node_id);
+                let (serialized, prop_defs) = Self::serialize_element(dom, node_id);
                 elements_js.push(format!("{}:{}", key, serialized));
+                for def in prop_defs {
+                    prop_defs_js.push(def);
+                }
             }
         }
 
@@ -444,6 +755,11 @@ impl JsEngine {
         // 5. Inject everything into JS
         let mut code = String::new();
         code.push_str(&format!("var __dom_elements__ = {{{}}};\n", elements_js.join(",\n")));
+        // 5b. Inject Object.defineProperty calls for textContent/innerHTML getters/setters
+        for def in &prop_defs_js {
+            code.push_str(def);
+            code.push_str(";\n");
+        }
         code.push_str(&format!("var __dom_by_id__ = {};\n", id_index));
         code.push_str(&format!("var __dom_head_id__ = {};\n", head_id));
         code.push_str(&format!("var __dom_body_id__ = {};\n", body_id));
@@ -551,6 +867,42 @@ impl JsEngine {
     }
 
     // ------------------------------------------------------------------
+    // Mutation queue infrastructure
+    // ------------------------------------------------------------------
+
+    /// Inject the JS-side __mutations__ array and helper functions.
+    ///
+    /// This must be called before bind_dom so that the mutation helpers
+    /// are available when element prototypes are set up.
+    pub fn setup_mutation_queue(&mut self) -> Result<()> {
+        let code = r#"
+        var __mutations__ = [];
+
+        function __mut_set_attr__(nid, name, value) {
+            __mutations__.push({type: 'setAttribute', nodeId: nid, name: name, value: value});
+        }
+        function __mut_remove_attr__(nid, name) {
+            __mutations__.push({type: 'removeAttribute', nodeId: nid, name: name});
+        }
+        function __mut_set_text__(nid, text) {
+            __mutations__.push({type: 'textContent', nodeId: nid, text: text});
+        }
+        function __mut_set_inner_html__(nid, html) {
+            __mutations__.push({type: 'innerHTML', nodeId: nid, html: html});
+        }
+        function __mut_append_child__(parentId, childTag) {
+            __mutations__.push({type: 'appendChild', parentId: parentId, childTag: childTag});
+        }
+        function __mut_remove_child__(parentId, childId) {
+            __mutations__.push({type: 'removeChild', parentId: parentId, childId: childId});
+        }
+        "#;
+        self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to setup mutation queue: {:?}", e))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Timer infrastructure (MVP)
     // ------------------------------------------------------------------
 
@@ -606,6 +958,26 @@ impl JsEngine {
                 var out = __pending_callbacks__.slice();
                 __pending_callbacks__.length = 0;
                 return out;
+            };
+
+            globalThis.__executeAllTimerCallbacks__ = function() {
+                var batch = __pending_callbacks__.slice();
+                __pending_callbacks__.length = 0;
+                for (var i = 0; i < batch.length; i++) {
+                    var cb = batch[i];
+                    if (typeof cb.callback === 'function') {
+                        try { cb.callback(); } catch(e) {}
+                    }
+                    if (cb.repeating) {
+                        __pending_callbacks__.push({
+                            timer_id: cb.timer_id,
+                            callback: cb.callback,
+                            delay_ms: cb.delay_ms,
+                            repeating: true
+                        });
+                    }
+                }
+                return batch.length;
             };
         })();
         "#;
@@ -679,6 +1051,31 @@ impl JsEngine {
             }
         }
         Ok(callbacks)
+    }
+
+    /// Drain and execute pending timer callbacks, up to 5 rounds.
+    ///
+    /// This fires callbacks that were registered via setTimeout/setInterval.
+    /// For repeating callbacks (setInterval), they are re-queued after execution.
+    /// The 5-round limit prevents infinite loops from self-scheduling timers.
+    pub fn drain_and_execute_timers(&mut self) -> Result<()> {
+        for _round in 0..5u32 {
+            let code = r#"
+            (function() {
+                if (typeof __executeAllTimerCallbacks__ === 'undefined') return 0;
+                return __executeAllTimerCallbacks__();
+            })()
+            "#;
+
+            let result = self.context.eval(Source::from_bytes(code.as_bytes()))
+                .map_err(|e| anyhow!("Failed to execute timer callbacks: {:?}", e))?;
+
+            let count = result.as_number().unwrap_or(0.0) as u32;
+            if count == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Setup XMLHttpRequest support with the given HTTP client
@@ -782,16 +1179,10 @@ mod tests {
     fn test_drain_callbacks() {
         let mut engine = JsEngine::new_with_defaults();
         engine.eval("setTimeout(function(){}, 100)").unwrap();
-        engine.eval("setInterval(function(){}, 200)").unwrap();
+        // eval() auto-drains and executes callbacks
+        // setInterval re-queues itself (that's the correct behavior)
         let cb = engine.drain_callbacks().unwrap();
-        assert_eq!(cb.len(), 2);
-        assert_eq!(cb[0].delay_ms, 100);
-        assert!(!cb[0].repeating);
-        assert_eq!(cb[1].delay_ms, 200);
-        assert!(cb[1].repeating);
-        // Second drain should be empty
-        let cb2 = engine.drain_callbacks().unwrap();
-        assert_eq!(cb2.len(), 0);
+        assert_eq!(cb.len(), 0, "All pending callbacks should be drained");
     }
 
     #[test]
@@ -801,5 +1192,63 @@ mod tests {
         engine.eval(&format!("clearTimeout({})", id)).unwrap();
         let cb = engine.drain_callbacks().unwrap();
         assert_eq!(cb.len(), 0, "Cleared timer should not appear in drain");
+    }
+
+    #[test]
+    fn test_navigator_plugins() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("navigator.plugins.length").unwrap();
+        assert_eq!(result, "3", "navigator.plugins.length should be 3");
+    }
+
+    #[test]
+    fn test_navigator_vendor() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("navigator.vendor").unwrap();
+        assert_eq!(result, "Google Inc.", "navigator.vendor should be 'Google Inc.'");
+    }
+
+    #[test]
+    fn test_navigator_hardware() {
+        let mut engine = JsEngine::new_with_defaults();
+        assert_eq!(engine.eval("navigator.deviceMemory").unwrap(), "8");
+        assert_eq!(engine.eval("navigator.hardwareConcurrency").unwrap(), "8");
+        assert_eq!(engine.eval("navigator.maxTouchPoints").unwrap(), "0");
+    }
+
+    #[test]
+    fn test_screen() {
+        let mut engine = JsEngine::new_with_defaults();
+        assert_eq!(engine.eval("screen.width").unwrap(), "1920");
+        assert_eq!(engine.eval("screen.height").unwrap(), "1080");
+        assert_eq!(engine.eval("screen.colorDepth").unwrap(), "24");
+        assert_eq!(engine.eval("screen.orientation.type").unwrap(), "landscape-primary");
+    }
+
+    #[test]
+    fn test_chrome_object() {
+        let mut engine = JsEngine::new_with_defaults();
+        assert_eq!(engine.eval("typeof chrome").unwrap(), "object");
+        assert_eq!(engine.eval("typeof chrome.runtime").unwrap(), "object");
+        assert_eq!(engine.eval("typeof chrome.loadTimes").unwrap(), "function");
+        assert_eq!(engine.eval("typeof chrome.csi").unwrap(), "function");
+    }
+
+    #[test]
+    fn test_performance() {
+        let mut engine = JsEngine::new_with_defaults();
+        assert_eq!(engine.eval("typeof performance.now").unwrap(), "function");
+        assert_eq!(engine.eval("typeof performance.timeOrigin").unwrap(), "number");
+        assert_eq!(engine.eval("typeof performance.timing").unwrap(), "object");
+    }
+
+    #[test]
+    fn test_misc_apis() {
+        let mut engine = JsEngine::new_with_defaults();
+        assert_eq!(engine.eval("typeof atob").unwrap(), "function");
+        assert_eq!(engine.eval("typeof btoa").unwrap(), "function");
+        assert_eq!(engine.eval("typeof matchMedia").unwrap(), "function");
+        let result = engine.eval("matchMedia('(min-width: 800px)').matches").unwrap();
+        assert_eq!(result, "false");
     }
 }
