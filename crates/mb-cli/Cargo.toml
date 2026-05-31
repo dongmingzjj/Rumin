@@ -1,0 +1,17 @@
+[package]
+name = "mb-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "minibrowser"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+mb-core = { path = "../mb-core" }
+mb-dom = { path = "../mb-dom" }

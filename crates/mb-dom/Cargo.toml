@@ -1,0 +1,11 @@
+[package]
+name = "mb-dom"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+slotmap = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "mb-js"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+mb-dom = { path = "../mb-dom" }
+boa_engine = "0.19"
+slotmap = "1.1"

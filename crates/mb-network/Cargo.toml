@@ -1,0 +1,16 @@
+[package]
+name = "mb-network"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+bytes = "1"
+http = "1"
+wreq = { version = "6.0.0-rc.28", default-features = false, features = ["cookies", "gzip", "brotli", "deflate", "json"] }
+wreq-util = { version = "3.0.0-rc.11", default-features = false, features = ["emulation"] }

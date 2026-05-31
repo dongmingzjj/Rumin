@@ -1,0 +1,11 @@
+[package]
+name = "mb-html"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+mb-dom = { path = "../mb-dom" }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
