@@ -5,6 +5,7 @@
 //! - navigator.userAgent
 //! - location.href
 //! - document (DOM bridge via bind_dom)
+//! - setTimeout / setInterval / clearTimeout / clearInterval (MVP)
 
 use anyhow::{Result, anyhow};
 use boa_engine::{Context, Source, JsValue, JsString};
@@ -12,21 +13,37 @@ use mb_dom::tree::DomTree;
 use mb_dom::node::{NodeKind, NodeId};
 use slotmap::Key;
 
+pub mod xhr;
+
+/// A pending timer callback registered via setTimeout/setInterval.
+#[derive(Debug, Clone)]
+pub struct PendingCallback {
+    pub timer_id: u32,
+    pub delay_ms: u32,
+    pub repeating: bool,
+    pub fire_at_ms: u64,
+}
+
 /// JavaScript engine wrapper around boa_engine
 pub struct JsEngine {
     context: Context,
+    pending_callbacks: Vec<PendingCallback>,
 }
 
 impl JsEngine {
     /// Create a new JS engine instance
     pub fn new() -> Self {
         let context = Context::default();
-        Self { context }
+        Self {
+            context,
+            pending_callbacks: Vec::new(),
+        }
     }
 
     /// Create a new engine with console, navigator, and location set up
     pub fn new_with_defaults() -> Self {
         let mut engine = Self::new();
+        let _ = engine.setup_timers();
         let _ = engine.setup_console();
         let _ = engine.setup_navigator();
         let _ = engine.setup_location("about:blank");
@@ -132,10 +149,13 @@ impl JsEngine {
         Ok(output)
     }
 
-    /// Setup navigator object
+    /// Setup navigator object — set as a true global property.
+    ///
+    /// Uses `globalThis.navigator = {...}` because boa_engine 0.19
+    /// does not persist `var` declarations across eval calls.
     pub fn setup_navigator(&mut self) -> Result<()> {
         let code = r#"
-        var navigator = {
+        globalThis.navigator = {
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
             platform: 'MacIntel',
             language: 'en-US',
@@ -143,6 +163,7 @@ impl JsEngine {
             cookieEnabled: true,
             onLine: true
         };
+        globalThis.window = globalThis;
         "#;
 
         self.context.eval(Source::from_bytes(code.as_bytes()))
@@ -150,26 +171,37 @@ impl JsEngine {
         Ok(())
     }
 
-    /// Setup location object
+    /// Setup location object — set as a true global property.
     pub fn setup_location(&mut self, url: &str) -> Result<()> {
         let (protocol, host, pathname, search, hash) = Self::parse_url_components(url);
         let origin = if host.is_empty() { String::new() } else { format!("{}{}", protocol, host) };
+        // Derive port from protocol
+        let port = if protocol == "https://" {
+            "443".to_string()
+        } else if protocol == "http://" {
+            "80".to_string()
+        } else {
+            String::new()
+        };
 
         let code = format!(r#"
-        var location = {{
+        globalThis.location = {{
             href: {},
             protocol: {},
             host: {},
             hostname: {},
+            port: {},
             pathname: {},
             search: {},
             hash: {},
             origin: {}
         }};
+        globalThis.window = globalThis;
         "#, format_args!("{:?}", url),
             format_args!("{:?}", protocol),
             format_args!("{:?}", host),
             format_args!("{:?}", host),
+            format_args!("{:?}", port),
             format_args!("{:?}", pathname),
             format_args!("{:?}", search),
             format_args!("{:?}", hash),
@@ -372,6 +404,9 @@ impl JsEngine {
     ///
     /// This serializes all elements into a `__dom_elements__` global object,
     /// and creates a `document` with standard methods (getElementById, querySelector, etc.).
+    ///
+    /// The `document` object is also set as a true global property so that
+    /// both `document.title` and `window.document.title` work.
     pub fn bind_dom(&mut self, dom: &DomTree) -> Result<()> {
         // 1. Serialize all element nodes
         let mut elements_js = Vec::new();
@@ -419,85 +454,91 @@ impl JsEngine {
              return e || null;\n\
              };\n",
         );
-        code.push_str(&format!("var document = {{\n\
-            _title: {title},\n\
-            nodeType: 9,\n\
-            nodeName: \"#document\",\n\
-            get title() {{ return this._title; }},\n\
-            set title(v) {{ this._title = String(v); }},\n\
-            get head() {{ return __dom_node_name__(__dom_head_id__); }},\n\
-            get body() {{ return __dom_node_name__(__dom_body_id__); }},\n\
-            cookie: \"\",\n\
-            getElementById: function(id) {{\n\
-                var nid = __dom_by_id__[id];\n\
-                if (nid === undefined || nid === null) return null;\n\
-                return __dom_elements__[nid] || null;\n\
-            }},\n\
-            getElementsByTagName: function(tag) {{\n\
-                tag = tag.toUpperCase();\n\
-                var result = [];\n\
-                for (var k in __dom_elements__) {{\n\
-                    var e = __dom_elements__[k];\n\
-                    if (e && e.tagName === tag) result.push(e);\n\
-                }}\n\
-                return result;\n\
-            }},\n\
-            getElementsByClassName: function(cls) {{\n\
-                var result = [];\n\
-                for (var k in __dom_elements__) {{\n\
-                    var e = __dom_elements__[k];\n\
-                    if (e && e.className && e.className.split(' ').indexOf(cls) >= 0) result.push(e);\n\
-                }}\n\
-                return result;\n\
-            }},\n\
-            querySelector: function(sel) {{\n\
-                sel = sel.trim();\n\
-                if (sel.charAt(0) === '#') {{\n\
-                    return this.getElementById(sel.substring(1));\n\
-                }}\n\
-                if (sel.charAt(0) === '.') {{\n\
-                    var cls = sel.substring(1);\n\
-                    var arr = this.getElementsByClassName(cls);\n\
-                    return arr.length > 0 ? arr[0] : null;\n\
-                }}\n\
-                var arr = this.getElementsByTagName(sel);\n\
-                return arr.length > 0 ? arr[0] : null;\n\
-            }},\n\
-            querySelectorAll: function(sel) {{\n\
-                sel = sel.trim();\n\
-                if (sel.charAt(0) === '#') {{\n\
-                    var e = this.getElementById(sel.substring(1));\n\
-                    return e ? [e] : [];\n\
-                }}\n\
-                if (sel.charAt(0) === '.') {{\n\
-                    return this.getElementsByClassName(sel.substring(1));\n\
-                }}\n\
-                return this.getElementsByTagName(sel);\n\
-            }},\n\
-            createElement: function(tag) {{\n\
-                var newId = 'created_' + (++document._createCounter);\n\
-                var el = {{\n\
-                    tagName: tag.toUpperCase(),\n\
-                    id: \"\",\n\
-                    className: \"\",\n\
-                    textContent: \"\",\n\
-                    innerHTML: \"\",\n\
-                    getAttribute: function(n) {{ return this._attrs[n] || null; }},\n\
-                    setAttribute: function(n, v) {{ this._attrs[n] = String(v); }},\n\
-                    hasAttribute: function(n) {{ return n in this._attrs; }},\n\
-                    style: {{}},\n\
-                    _attrs: {{}},\n\
-                    children: [],\n\
-                    childNodes: [],\n\
-                    parentNode: null\n\
-                }};\n\
-                __dom_elements__[newId] = el;\n\
-                return el;\n\
-            }},\n\
-            _createCounter: 0\n\
-            }};\n",
-            title = title,
+        code.push_str(&format!(r#"globalThis.document = {{
+            _title: {title},
+            nodeType: 9,
+            nodeName: '#document',
+            get title() {{ return this._title; }},
+            set title(v) {{ this._title = String(v); }},
+            get head() {{ return __dom_node_name__(__dom_head_id__); }},
+            get body() {{ return __dom_node_name__(__dom_body_id__); }},
+            cookie: "",
+            getElementById: function(id) {{
+                var nid = __dom_by_id__[id];
+                if (nid === undefined || nid === null) return null;
+                return __dom_elements__[nid] || null;
+            }},
+            getElementsByTagName: function(tag) {{
+                tag = tag.toUpperCase();
+                var result = [];
+                for (var k in __dom_elements__) {{
+                    var e = __dom_elements__[k];
+                    if (e && e.tagName === tag) result.push(e);
+                }}
+                return result;
+            }},
+            getElementsByClassName: function(cls) {{
+                var result = [];
+                for (var k in __dom_elements__) {{
+                    var e = __dom_elements__[k];
+                    if (e && e.className && e.className.split(' ').indexOf(cls) >= 0) result.push(e);
+                }}
+                return result;
+            }},
+            querySelector: function(sel) {{
+                sel = sel.trim();
+                if (sel.charAt(0) === '#') {{
+                    return this.getElementById(sel.substring(1));
+                }}
+                if (sel.charAt(0) === '.') {{
+                    var cls = sel.substring(1);
+                    var arr = this.getElementsByClassName(cls);
+                    return arr.length > 0 ? arr[0] : null;
+                }}
+                var arr = this.getElementsByTagName(sel);
+                return arr.length > 0 ? arr[0] : null;
+            }},
+            querySelectorAll: function(sel) {{
+                sel = sel.trim();
+                if (sel.charAt(0) === '#') {{
+                    var e = this.getElementById(sel.substring(1));
+                    return e ? [e] : [];
+                }}
+                if (sel.charAt(0) === '.') {{
+                    return this.getElementsByClassName(sel.substring(1));
+                }}
+                return this.getElementsByTagName(sel);
+            }},
+"#, title = title,
         ));
+        // createElement is split into a separate push_str to avoid
+        // complex escaping issues inside format!().
+        code.push_str(r#"            createElement: function(tag) {
+                var newId = 'created_' + (++this._createCounter);
+                var el = {
+                    tagName: tag.toUpperCase(),
+                    id: "",
+                    className: "",
+                    textContent: "",
+                    innerHTML: "",
+                    getAttribute: function(n) { return this._attrs[n] || null; },
+                    setAttribute: function(n, v) { this._attrs[n] = String(v); },
+                    hasAttribute: function(n) { return n in this._attrs; },
+                    style: {},
+                    _attrs: {},
+                    children: [],
+                    childNodes: [],
+                    parentNode: null
+                };
+                __dom_elements__[newId] = el;
+                return el;
+            },
+            _createCounter: 0
+            };
+"#);
+
+        // Set window alias so `window.xxx` works.
+        code.push_str("globalThis.window = globalThis;\n");
 
         // Fault-tolerant: if boa_engine cannot parse the generated JS
         // (e.g. getter/setter syntax not supported), log a warning and
@@ -507,6 +548,143 @@ impl JsEngine {
         }
 
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Timer infrastructure (MVP)
+    // ------------------------------------------------------------------
+
+    /// Register the global setTimeout / setInterval / clearTimeout /
+    /// clearInterval functions.
+    ///
+    /// Callbacks are accumulated in a JS-side `__pending_callbacks__`
+    /// array that can be drained from Rust via [`drain_callbacks`].
+    ///
+    /// Uses `globalThis.xxx = ...` instead of `var` / `function`
+    /// declarations because boa_engine 0.19 does not persist
+    /// eval-local bindings across separate eval calls.
+    pub fn setup_timers(&mut self) -> Result<()> {
+        let code = r#"
+        (function() {
+            var __next_timer_id__ = 1;
+            var __pending_callbacks__ = [];
+
+            globalThis.setTimeout = function(fn, delay) {
+                var id = __next_timer_id__++;
+                __pending_callbacks__.push({
+                    timer_id: id,
+                    callback: fn,
+                    delay_ms: delay || 0,
+                    repeating: false
+                });
+                return id;
+            };
+
+            globalThis.setInterval = function(fn, delay) {
+                var id = __next_timer_id__++;
+                __pending_callbacks__.push({
+                    timer_id: id,
+                    callback: fn,
+                    delay_ms: delay || 0,
+                    repeating: true
+                });
+                return id;
+            };
+
+            globalThis.clearTimeout = function(id) {
+                for (var i = 0; i < __pending_callbacks__.length; i++) {
+                    if (__pending_callbacks__[i].timer_id === id) {
+                        __pending_callbacks__.splice(i, 1);
+                        return;
+                    }
+                }
+            };
+
+            globalThis.clearInterval = globalThis.clearTimeout;
+
+            globalThis.__drainTimerCallbacks__ = function() {
+                var out = __pending_callbacks__.slice();
+                __pending_callbacks__.length = 0;
+                return out;
+            };
+        })();
+        "#;
+
+        self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to setup timers: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Drain pending timer callbacks from the JS side and return them
+    /// as Rust-side metadata.
+    ///
+    /// Each entry contains the timer id, delay, repeating flag, and a
+    /// fire-at timestamp (currently set to 0 — the caller can compute
+    /// the actual deadline from `delay_ms` and `std::time::Instant`).
+    ///
+    /// After draining, the JS-side `__pending_callbacks__` array is
+    /// cleared so the same callbacks are not returned twice.
+    ///
+    /// **MVP note:** The actual JS callback *function* stays on the JS
+    /// side; only metadata is returned.  A future iteration can store
+    /// `JsValue` references in `PendingCallback` and fire them
+    /// synchronously from Rust.
+    pub fn drain_callbacks(&mut self) -> Result<Vec<PendingCallback>> {
+        let code = r#"
+        (function() {
+            if (typeof __drainTimerCallbacks__ === 'undefined') return [];
+            return __drainTimerCallbacks__();
+        })()
+        "#;
+
+        let result = self.context.eval(Source::from_bytes(code.as_bytes()))
+            .map_err(|e| anyhow!("Failed to drain callbacks: {:?}", e))?;
+
+        let mut callbacks = Vec::new();
+        if let Some(arr) = result.as_object() {
+            let len = arr.get(JsString::from("length"), &mut self.context)
+                .ok()
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0) as usize;
+
+            for i in 0..len {
+                if let Ok(entry) = arr.get(i as f64, &mut self.context) {
+                    if let Some(obj) = entry.as_object() {
+                        let timer_id = obj
+                            .get(JsString::from("timer_id"), &mut self.context)
+                            .ok()
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(0.0) as u32;
+
+                        let delay_ms = obj
+                            .get(JsString::from("delay_ms"), &mut self.context)
+                            .ok()
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(0.0) as u32;
+
+                        let repeating = obj
+                            .get(JsString::from("repeating"), &mut self.context)
+                            .ok()
+                            .and_then(|v| v.as_boolean())
+                            .unwrap_or(false);
+
+                        callbacks.push(PendingCallback {
+                            timer_id,
+                            delay_ms,
+                            repeating,
+                            fire_at_ms: 0, // Caller can compute actual deadline
+                        });
+                    }
+                }
+            }
+        }
+        Ok(callbacks)
+    }
+
+    /// Setup XMLHttpRequest support with the given HTTP client
+    pub fn setup_xhr(&mut self, client: std::sync::Arc<mb_network::client::HttpClient>) -> Result<()> {
+        let handle = tokio::runtime::Handle::current();
+        xhr::register_xhr(&mut self.context, client, handle)
     }
 }
 
@@ -540,5 +718,88 @@ mod tests {
         engine.set_global("myVar", "42").unwrap();
         let result = engine.get_global("myVar").unwrap();
         assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_navigator_global() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("typeof navigator").unwrap();
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_window_alias() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("typeof window").unwrap();
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_window_navigator() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("window.navigator.userAgent").unwrap();
+        assert!(result.contains("Chrome"), "Expected Chrome UA, got: {}", result);
+    }
+
+    #[test]
+    fn test_location_global() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("typeof location").unwrap();
+        assert_eq!(result, "object");
+    }
+
+    #[test]
+    fn test_window_location() {
+        let mut engine = JsEngine::new_with_defaults();
+        engine.setup_location("https://example.com/path?q=1").unwrap();
+        let result = engine.eval("window.location.href").unwrap();
+        assert_eq!(result, "https://example.com/path?q=1");
+    }
+
+    #[test]
+    fn test_settimeout_typeof() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("typeof setTimeout").unwrap();
+        assert_eq!(result, "function");
+    }
+
+    #[test]
+    fn test_setinterval_typeof() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("typeof setInterval").unwrap();
+        assert_eq!(result, "function");
+    }
+
+    #[test]
+    fn test_settimeout_returns_id() {
+        let mut engine = JsEngine::new_with_defaults();
+        let result = engine.eval("setTimeout(function(){}, 100)").unwrap();
+        let id: u32 = result.parse().unwrap();
+        assert!(id >= 1, "Expected timer_id >= 1, got {}", id);
+    }
+
+    #[test]
+    fn test_drain_callbacks() {
+        let mut engine = JsEngine::new_with_defaults();
+        engine.eval("setTimeout(function(){}, 100)").unwrap();
+        engine.eval("setInterval(function(){}, 200)").unwrap();
+        let cb = engine.drain_callbacks().unwrap();
+        assert_eq!(cb.len(), 2);
+        assert_eq!(cb[0].delay_ms, 100);
+        assert!(!cb[0].repeating);
+        assert_eq!(cb[1].delay_ms, 200);
+        assert!(cb[1].repeating);
+        // Second drain should be empty
+        let cb2 = engine.drain_callbacks().unwrap();
+        assert_eq!(cb2.len(), 0);
+    }
+
+    #[test]
+    fn test_cleartimeout() {
+        let mut engine = JsEngine::new_with_defaults();
+        let id = engine.eval("var tid = setTimeout(function(){}, 100); tid").unwrap();
+        engine.eval(&format!("clearTimeout({})", id)).unwrap();
+        let cb = engine.drain_callbacks().unwrap();
+        assert_eq!(cb.len(), 0, "Cleared timer should not appear in drain");
     }
 }

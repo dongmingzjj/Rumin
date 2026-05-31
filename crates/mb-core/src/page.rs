@@ -73,6 +73,11 @@ impl Page {
         // 5. Inject DOM tree into JS environment
         self.js.bind_dom(&self.dom)?;
 
+        // 5b. Setup XMLHttpRequest support
+        if let Err(e) = self.js.setup_xhr(Arc::clone(&self.client)) {
+            tracing::warn!("Failed to setup XHR: {}", e);
+        }
+
         // 6. Collect and optionally execute inline scripts
         let scripts = HtmlParser::collect_scripts(&self.dom);
         for script in &scripts {
