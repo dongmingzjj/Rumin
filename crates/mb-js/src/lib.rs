@@ -755,14 +755,6 @@ impl JsEngine {
         let text = Self::escape_js_string(&Self::serialize_text_content(tree, node_id));
         let inner_html = Self::escape_js_string(&Self::serialize_inner_html(tree, node_id));
 
-        // Collect child element node IDs
-        let child_ids: Vec<u64> = tree.children(node_id)
-            .into_iter()
-            .map(|id| id.data().as_ffi())
-            .collect();
-        let child_ids_str: Vec<String> = child_ids.iter().map(|i| i.to_string()).collect();
-        let child_ids_js = format!("[{}]", child_ids_str.join(","));
-
         // Parent node ID
         let parent_js = node.parent
             .map(|p| p.data().as_ffi().to_string())
@@ -807,8 +799,11 @@ impl JsEngine {
 
         let nid = node_id.data().as_ffi();
 
+        // Build the element literal — note: _parentId and _childNodesIds are internal
+        // backing stores. Getters for parentNode, children, childNodes are added via
+        // Object.defineProperty below so they always return live objects from __dom_elements__.
         let element_literal = format!(
-            r#"{{tagName:"{tag}",id:{id},className:{cls},_nodeId:{nid},_textContent:{txt},_innerHTML:{inner_html},getAttribute:function(n){{return this._attrs[n]||null}},setAttribute:function(n,v){{this._attrs[n]=String(v);__mut_set_attr__(this._nodeId,n,String(v))}},removeAttribute:function(n){{delete this._attrs[n];__mut_remove_attr__(this._nodeId,n)}},hasAttribute:function(n){{return n in this._attrs}},remove:function(){{if(this.parentNode!==null){{__mut_remove_child__(this.parentNode,this._nodeId)}}}},style:{style},_attrs:{attrs},children:{children},childNodes:{child_nodes},parentNode:{parent}}}"#,
+            r#"{{tagName:"{tag}",id:{id},className:{cls},_nodeId:{nid},_parentId:{parent_id},_childNodesIds:{child_nodes},_textContent:{txt},_innerHTML:{inner_html},_attrs:{attrs},style:{style}}}"#,
             tag = tag.to_uppercase(),
             id = Self::escape_js_string(id),
             cls = Self::escape_js_string(&class_name),
@@ -817,9 +812,8 @@ impl JsEngine {
             nid = nid,
             style = style_js,
             attrs = attrs_js,
-            children = child_ids_js,
             child_nodes = child_nodes_js,
-            parent = parent_js,
+            parent_id = parent_js,
         );
 
         // Object.defineProperty calls for textContent and innerHTML with mutation tracking.
@@ -845,6 +839,30 @@ impl JsEngine {
                     }});
                 }});
             }})(__dom_elements__[{nid}])"#,
+            nid = nid
+        ));
+
+        // parentNode getter — returns live object from __dom_elements__ (not raw node ID)
+        prop_defs.push(format!(
+            r#"Object.defineProperty(__dom_elements__[{nid}],'parentNode',{{get:function(){{return this._parentId?(__dom_elements__[this._parentId]||null):null}},enumerable:true,configurable:true}})"#,
+            nid = nid
+        ));
+
+        // children getter — returns only element children (filter out text nodes)
+        prop_defs.push(format!(
+            r#"Object.defineProperty(__dom_elements__[{nid}],'children',{{get:function(){{var r=[];var ids=this._childNodesIds||[];for(var i=0;i<ids.length;i++){{var e=__dom_elements__[ids[i]];if(e&&e.tagName)r.push(e)}}return r}},enumerable:true,configurable:true}})"#,
+            nid = nid
+        ));
+
+        // childNodes getter — returns all child nodes (elements + text)
+        prop_defs.push(format!(
+            r#"Object.defineProperty(__dom_elements__[{nid}],'childNodes',{{get:function(){{var r=[];var ids=this._childNodesIds||[];for(var i=0;i<ids.length;i++){{var e=__dom_elements__[ids[i]];if(e)r.push(e)}}return r}},enumerable:true,configurable:true}})"#,
+            nid = nid
+        ));
+
+        // Set the shared prototype so all DOM methods are available
+        prop_defs.push(format!(
+            r#"Object.setPrototypeOf(__dom_elements__[{nid}],__dom_element_proto__)"#,
             nid = nid
         ));
 
@@ -939,12 +957,17 @@ impl JsEngine {
             if let NodeKind::Text(ref t) = &node.kind {
                 let key = node_id.data().as_ffi();
                 let text = Self::escape_js_string(&t.data);
-                let parent_js = node.parent
+                let parent_id = node.parent
                     .map(|p| p.data().as_ffi().to_string())
                     .unwrap_or_else(|| "null".to_string());
                 elements_js.push(format!(
-                    "{}:{{nodeType:3,nodeName:\"#text\",textContent:{},parentNode:{}}}",
-                    key, text, parent_js
+                    "{}:{{nodeType:3,nodeName:\"#text\",textContent:{},_parentId:{}}}",
+                    key, text, parent_id
+                ));
+                // Add parentNode getter for text nodes too
+                prop_defs_js.push(format!(
+                    r#"Object.defineProperty(__dom_elements__[{key}],'parentNode',{{get:function(){{return this._parentId?(__dom_elements__[this._parentId]||null):null}},enumerable:true,configurable:true}})"#,
+                    key = key
                 ));
             }
         }
@@ -1051,13 +1074,12 @@ globalThis.document = {{
     createElement: function(tag) {{
         var newId = 'created_' + (++this._createCounter);
         var el = {{
-            tagName: tag.toUpperCase(), id: "", className: "", textContent: "", innerHTML: "",
-            _attrs: {{}}, children: [], childNodes: [], parentNode: null,
-            getAttribute: function(n) {{ return this._attrs[n] || null; }},
-            setAttribute: function(n, v) {{ this._attrs[n] = String(v); }},
-            hasAttribute: function(n) {{ return n in this._attrs; }},
-            style: {{}}
+            tagName: tag.toUpperCase(), id: "", className: "",
+            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _textContent: "", _innerHTML: "",
+            _attrs: {{}}, style: {{}}
         }};
+        Object.setPrototypeOf(el, __dom_element_proto__);
         if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = el;
         return el;
     }},
@@ -1203,6 +1225,149 @@ globalThis.document = {{
         function __mut_remove_child__(parentId, childId) {
             __mutations__.push({type: 'removeChild', parentId: parentId, childId: childId});
         }
+
+        // Shared prototype for all DOM elements — add methods here once, all elements inherit them
+        var __dom_element_proto__ = {
+            appendChild: function(child) {
+                var childId = child._nodeId;
+                if (childId) {
+                    __mut_append_child__(this._nodeId, childId);
+                } else {
+                    __mut_append_child__(this._nodeId, child.tagName);
+                }
+                this._childNodesIds.push(childId || 0);
+                child._parentId = this._nodeId;
+                return child;
+            },
+            insertBefore: function(newNode, refNode) {
+                if (!refNode) return this.appendChild(newNode);
+                var newId = newNode._nodeId || 0;
+                var refId = refNode._nodeId || 0;
+                __mut_append_child__(this._nodeId, newId);
+                var refIdx = this._childNodesIds.indexOf(refId);
+                if (refIdx >= 0) {
+                    this._childNodesIds.splice(refIdx, 0, newId);
+                } else {
+                    this._childNodesIds.push(newId);
+                }
+                newNode._parentId = this._nodeId;
+                return newNode;
+            },
+            removeChild: function(child) {
+                var childId = child._nodeId || 0;
+                __mut_remove_child__(this._nodeId, childId);
+                var idx = this._childNodesIds.indexOf(childId);
+                if (idx >= 0) this._childNodesIds.splice(idx, 1);
+                child._parentId = null;
+                return child;
+            },
+            remove: function() {
+                var parent = this.parentNode;
+                if (parent && typeof parent.removeChild === 'function') {
+                    parent.removeChild(this);
+                }
+            },
+            cloneNode: function(deep) {
+                var clone = {
+                    tagName: this.tagName, id: this.id || '', className: this.className || '',
+                    _nodeId: 0, _parentId: null, _childNodesIds: [],
+                    _textContent: this._textContent || '', _innerHTML: this._innerHTML || '',
+                    _attrs: JSON.parse(JSON.stringify(this._attrs || {})),
+                    style: JSON.parse(JSON.stringify(this.style || {}))
+                };
+                Object.setPrototypeOf(clone, __dom_element_proto__);
+                if (deep) {
+                    var kids = this._childNodesIds || [];
+                    for (var i = 0; i < kids.length; i++) {
+                        var child = __dom_elements__[kids[i]];
+                        if (child && typeof child.cloneNode === 'function') {
+                            clone._childNodesIds.push(0);
+                        }
+                    }
+                }
+                return clone;
+            },
+            addEventListener: function(type, listener) {
+                if (!this._listeners) this._listeners = {};
+                if (!this._listeners[type]) this._listeners[type] = [];
+                this._listeners[type].push(listener);
+            },
+            removeEventListener: function(type, listener) {
+                if (this._listeners && this._listeners[type]) {
+                    var idx = this._listeners[type].indexOf(listener);
+                    if (idx >= 0) this._listeners[type].splice(idx, 1);
+                }
+            },
+            dispatchEvent: function(event) {
+                if (this._listeners && this._listeners[event.type]) {
+                    var self = this;
+                    this._listeners[event.type].forEach(function(l) { l.call(self, event); });
+                }
+                return true;
+            },
+            matches: function(selector) {
+                selector = selector.trim();
+                if (selector.charAt(0) === '#') return this.id === selector.substring(1);
+                if (selector.charAt(0) === '.') {
+                    return (this.className || '').split(' ').indexOf(selector.substring(1)) >= 0;
+                }
+                return this.tagName === selector.toUpperCase();
+            },
+            closest: function(selector) {
+                var node = this;
+                while (node) {
+                    if (typeof node.matches === 'function' && node.matches(selector)) return node;
+                    node = node.parentNode;
+                }
+                return null;
+            },
+            contains: function(other) {
+                while (other) {
+                    if (other === this) return true;
+                    other = other.parentNode;
+                }
+                return false;
+            },
+            getAttribute: function(n) { return this._attrs[n] || null; },
+            setAttribute: function(n, v) { this._attrs[n] = String(v); __mut_set_attr__(this._nodeId, n, String(v)); },
+            removeAttribute: function(n) { delete this._attrs[n]; __mut_remove_attr__(this._nodeId, n); },
+            hasAttribute: function(n) { return n in this._attrs; },
+            get firstChild() {
+                if (!this._childNodesIds || this._childNodesIds.length === 0) return null;
+                return __dom_elements__[this._childNodesIds[0]] || null;
+            },
+            get lastChild() {
+                if (!this._childNodesIds || this._childNodesIds.length === 0) return null;
+                return __dom_elements__[this._childNodesIds[this._childNodesIds.length - 1]] || null;
+            },
+            get nextSibling() {
+                var p = this.parentNode;
+                if (!p || !p._childNodesIds) return null;
+                var idx = p._childNodesIds.indexOf(this._nodeId);
+                if (idx < 0 || idx >= p._childNodesIds.length - 1) return null;
+                return __dom_elements__[p._childNodesIds[idx + 1]] || null;
+            },
+            get previousSibling() {
+                var p = this.parentNode;
+                if (!p || !p._childNodesIds) return null;
+                var idx = p._childNodesIds.indexOf(this._nodeId);
+                if (idx <= 0) return null;
+                return __dom_elements__[p._childNodesIds[idx - 1]] || null;
+            },
+            get outerHTML() {
+                var tag = (this.tagName || '').toLowerCase();
+                var attrs = '';
+                var a = this._attrs || {};
+                for (var k in a) {
+                    if (a.hasOwnProperty(k)) {
+                        attrs += ' ' + k + '="' + String(a[k]).replace(/"/g, '&quot;') + '"';
+                    }
+                }
+                var voidTags = {area:1,base:1,br:1,col:1,embed:1,hr:1,img:1,input:1,link:1,meta:1,param:1,source:1,track:1,wbr:1};
+                if (voidTags[tag]) return '<' + tag + attrs + '>';
+                return '<' + tag + attrs + '>' + (this.innerHTML || '') + '</' + tag + '>';
+            }
+        };
         "#;
         self.context.with(|ctx| -> rquickjs::Result<()> {
             let _: Value = ctx.eval(code)?;
@@ -1533,5 +1698,115 @@ mod tests {
         assert_eq!(engine.eval("typeof matchMedia").unwrap(), "function");
         let result = engine.eval("matchMedia('(min-width: 800px)').matches").unwrap();
         assert_eq!(result, "false");
+    }
+
+    #[test]
+    fn test_dom_element_proto_methods() {
+        use mb_dom::tree::DomTree;
+
+        let mut dom = DomTree::new();
+        // Add an h1 element to body
+        let h1_id = dom.create_element("h1");
+        dom.append_child(dom.body_node, h1_id);
+
+        let mut engine = JsEngine::new_with_defaults();
+        engine.bind_dom(&dom).unwrap();
+
+        // createElement should return an element with all proto methods
+        assert_eq!(engine.eval("typeof document.createElement('div').appendChild").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').removeChild").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').insertBefore").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').remove").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').cloneNode").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').addEventListener").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').removeEventListener").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').dispatchEvent").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').matches").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').closest").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').contains").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').getAttribute").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').setAttribute").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').removeAttribute").unwrap(), "function");
+        assert_eq!(engine.eval("typeof document.createElement('div').hasAttribute").unwrap(), "function");
+    }
+
+    #[test]
+    fn test_dom_parentnode_returns_object() {
+        use mb_dom::tree::DomTree;
+
+        let mut dom = DomTree::new();
+        let h1_id = dom.create_element("h1");
+        dom.append_child(dom.body_node, h1_id);
+
+        let mut engine = JsEngine::new_with_defaults();
+        engine.bind_dom(&dom).unwrap();
+
+        // parentNode should return an object (not a number)
+        let result = engine.eval("typeof document.querySelector('h1').parentNode").unwrap();
+        assert_eq!(result, "object", "parentNode should return an object, not a number");
+
+        // parentNode of body should be html
+        let tag = engine.eval("document.querySelector('body').parentNode.tagName").unwrap();
+        assert_eq!(tag, "HTML");
+    }
+
+    #[test]
+    fn test_dom_children_returns_objects() {
+        use mb_dom::tree::DomTree;
+
+        let mut dom = DomTree::new();
+        let h1_id = dom.create_element("h1");
+        dom.append_child(dom.body_node, h1_id);
+
+        let mut engine = JsEngine::new_with_defaults();
+        engine.bind_dom(&dom).unwrap();
+
+        // children should return an array of objects
+        let result = engine.eval("typeof document.querySelector('html').children[0]").unwrap();
+        assert_eq!(result, "object", "children[0] should be an object");
+
+        // childNodes should also return objects
+        let result = engine.eval("typeof document.querySelector('html').childNodes[0]").unwrap();
+        assert_eq!(result, "object", "childNodes[0] should be an object");
+    }
+
+    #[test]
+    fn test_dom_addeventlistener_no_error() {
+        use mb_dom::tree::DomTree;
+
+        let mut dom = DomTree::new();
+        let h1_id = dom.create_element("h1");
+        dom.append_child(dom.body_node, h1_id);
+
+        let mut engine = JsEngine::new_with_defaults();
+        engine.bind_dom(&dom).unwrap();
+
+        // addEventListener should not throw
+        let result = engine.eval("(function() { var el = document.querySelector('h1'); el.addEventListener('click', function(){}); return 'ok'; })()").unwrap();
+        assert_eq!(result, "ok");
+
+        // dispatchEvent should work
+        let result = engine.eval("(function() { var el = document.querySelector('h1'); var fired = false; el.addEventListener('click', function(){ fired = true; }); el.dispatchEvent({type:'click'}); return fired ? 'fired' : 'not fired'; })()").unwrap();
+        assert_eq!(result, "fired");
+    }
+
+    #[test]
+    fn test_dom_firstchild_lastchild() {
+        use mb_dom::tree::DomTree;
+
+        let mut dom = DomTree::new();
+        let h1_id = dom.create_element("h1");
+        dom.append_child(dom.body_node, h1_id);
+        let p_id = dom.create_element("p");
+        dom.append_child(dom.body_node, p_id);
+
+        let mut engine = JsEngine::new_with_defaults();
+        engine.bind_dom(&dom).unwrap();
+
+        // firstChild/lastChild of body should be h1 and p
+        let first = engine.eval("document.querySelector('body').firstChild.tagName").unwrap();
+        assert_eq!(first, "H1");
+        let last = engine.eval("document.querySelector('body').lastChild.tagName").unwrap();
+        assert_eq!(last, "P");
     }
 }
