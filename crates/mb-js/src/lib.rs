@@ -143,6 +143,24 @@ impl JsEngine {
             Ok(js_value_to_string(&val))
         }).map_err(|e| anyhow!("JS evaluation error: {:?}", e))?;
 
+        // Drain pending Promise jobs (execute .then() callbacks)
+        // NOTE: Must be called outside ctx.with() due to RefCell borrow conflict
+        let mut job_rounds = 0;
+        loop {
+            match self.runtime.execute_pending_job() {
+                Ok(true) => { job_rounds += 1; }
+                Ok(false) => break,
+                Err(e) => {
+                    tracing::warn!("Promise job error: {:?}", e);
+                    break;
+                }
+            }
+            if job_rounds > 100 { break; }
+        }
+        if job_rounds > 0 {
+            tracing::debug!("Executed {} Promise job rounds", job_rounds);
+        }
+
         // Drain any DOM mutations that were queued during eval
         if let Err(e) = self.drain_js_mutations() {
             tracing::warn!("Failed to drain JS mutations: {}", e);
