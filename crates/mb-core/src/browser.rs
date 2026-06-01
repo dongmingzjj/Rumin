@@ -19,8 +19,8 @@ pub struct Browser {
 impl Browser {
     /// Create a new browser with default configuration
     pub fn new() -> Result<Self> {
-        let client = HttpClient::new()?;
         let cookies = CookieJar::new();
+        let client = HttpClient::new()?.with_cookies(cookies.clone());
 
         Ok(Self {
             client: Arc::new(client),
@@ -30,8 +30,8 @@ impl Browser {
 
     /// Create a browser with custom client config
     pub fn with_config(config: ClientConfig) -> Result<Self> {
-        let client = HttpClient::with_config(config)?;
         let cookies = CookieJar::new();
+        let client = HttpClient::with_config(config)?.with_cookies(cookies.clone());
 
         Ok(Self {
             client: Arc::new(client),

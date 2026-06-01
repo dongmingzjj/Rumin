@@ -25,6 +25,12 @@ thread_local! {
     static DOM_ELEMENTS: RefCell<HashMap<u64, (String, Vec<String>, String, Option<u64>)>> = RefCell::new(HashMap::new());
 }
 
+/// Thread-local storage for CookieJar (shared with HttpClient)
+use mb_network::cookie::CookieJar;
+thread_local! {
+    static COOKIE_JAR: RefCell<Option<CookieJar>> = RefCell::new(None);
+}
+
 /// A mutation that was performed on the JS side and needs to be applied to the Rust DomTree.
 #[derive(Debug, Clone)]
 pub struct Mutation {
@@ -1012,7 +1018,8 @@ globalThis.document = {{
     set title(v) {{ this._title = String(v); }},
     get head() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_head_id__) : null; }},
     get body() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_body_id__) : null; }},
-    cookie: "",
+    get cookie() {{ return (typeof _get_cookies === 'function') ? _get_cookies() : ''; }},
+    set cookie(v) {{ if (typeof _set_cookie === 'function') _set_cookie(v); }},
     getElementById: function(id) {{
         if (typeof __dom_by_id__ === 'undefined') return null;
         var nid = __dom_by_id__[id];
@@ -1532,6 +1539,55 @@ globalThis.document = {{
     pub fn setup_xhr(&mut self, client: std::sync::Arc<mb_network::client::HttpClient>) -> Result<()> {
         let handle = tokio::runtime::Handle::current();
         xhr::register_xhr(&self.context, client, handle)
+    }
+
+    /// Set the CookieJar for document.cookie support
+    pub fn set_cookie_jar(&mut self, jar: CookieJar) -> Result<()> {
+        COOKIE_JAR.with(|cj| {
+            *cj.borrow_mut() = Some(jar);
+        });
+
+        // Register native cookie functions
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            use rquickjs::Function;
+            use rquickjs::function::Rest;
+
+            // _get_cookies() -> cookie string for current domain
+            let get_fn = Function::new(ctx.clone(), |_args: Rest<rquickjs::Value>| -> rquickjs::Result<String> {
+                let result = COOKIE_JAR.with(|cj| {
+                    let jar = cj.borrow();
+                    if let Some(ref j) = *jar {
+                        // Return all cookies as "name=value; name2=value2" string
+                        j.all_cookies().iter().map(|c| format!("{}={}", c.name, c.value)).collect::<Vec<_>>().join("; ")
+                    } else {
+                        String::new()
+                    }
+                });
+                Ok(result)
+            })?;
+            ctx.globals().set("_get_cookies", get_fn)?;
+
+            // _set_cookie(cookie_str) -> parse and store a cookie
+            let set_fn = Function::new(ctx.clone(), |args: Rest<rquickjs::Value>| -> rquickjs::Result<()> {
+                let cookie_str = args.get(0)
+                    .and_then(|v| v.as_string())
+                    .and_then(|s| s.to_string().ok())
+                    .unwrap_or_default();
+                if !cookie_str.is_empty() {
+                    COOKIE_JAR.with(|cj| {
+                        let mut jar = cj.borrow_mut();
+                        if let Some(ref mut j) = *jar {
+                            j.parse_set_cookie(&cookie_str, "");
+                        }
+                    });
+                }
+                Ok(())
+            })?;
+            ctx.globals().set("_set_cookie", set_fn)?;
+
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup cookies: {:?}", e))?;
+        Ok(())
     }
 }
 

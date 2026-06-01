@@ -81,6 +81,13 @@ impl Page {
             tracing::warn!("Failed to setup XHR: {}", e);
         }
 
+        // 5c. Setup CookieJar for document.cookie
+        if let Ok(jar) = self.cookies.lock() {
+            if let Err(e) = self.js.set_cookie_jar(jar.clone()) {
+                tracing::warn!("Failed to setup cookies: {}", e);
+            }
+        }
+
         // 6. Collect and optionally execute inline scripts
         let scripts = HtmlParser::collect_scripts(&self.dom);
         for script in &scripts {
