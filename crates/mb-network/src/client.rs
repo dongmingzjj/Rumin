@@ -168,6 +168,8 @@ impl HttpClient {
             .timeout(config.request_timeout)
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .pool_idle_timeout(config.pool_idle_timeout)
+            // Follow up to 10 redirects (wreq defaults to none)
+            .redirect(wreq::redirect::Policy::limited(10))
             // Apply TLS fingerprint emulation (sets TLS, HTTP/2, and headers)
             .emulation(config.emulation.to_emulation());
 
