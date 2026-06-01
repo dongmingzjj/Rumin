@@ -84,6 +84,13 @@ fn val_to_bool(v: Option<&Value>) -> Option<bool> {
     v.and_then(|v| v.as_bool())
 }
 
+/// Clear all XHR instance state (call after navigation)
+pub fn clear_xhr_instances() {
+    XHR_INSTANCES.with(|inst| {
+        inst.borrow_mut().clear();
+    });
+}
+
 /// Register XMLHttpRequest support in the JS context
 pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runtime_handle: Handle) -> Result<()> {
     XHR_CLIENT.with(|c| { *c.borrow_mut() = Some(http_client); });
@@ -363,15 +370,19 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
             match result {
                 Ok(response) => {
                     let status = response.status_code();
+                    let status_text = response.status.canonical_reason().unwrap_or("Unknown").to_string();
                     let text = response.text().unwrap_or_default();
-                    let mut hdrs = String::new();
+                    // Build headers JSON object
+                    let mut hdrs = Vec::new();
                     for (name, value) in response.headers.iter() {
-                        hdrs.push_str(&format!("{}:{}\n", name, value.to_str().unwrap_or("")));
+                        let k = serde_json::to_string(name.as_str()).unwrap_or_default();
+                        let v = serde_json::to_string(value.to_str().unwrap_or("")).unwrap_or_default();
+                        hdrs.push(format!("{}:{}", k, v));
                     }
-                    // Return JSON with all response data
+                    let headers_json = format!("{{{}}}", hdrs.join(","));
                     let body_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
-                    Ok(format!(r#"{{"ok":true,"status":{},"statusText":"{}","body":{},"headers":{{}}}}"#,
-                        status, status, body_json
+                    Ok(format!(r#"{{"ok":true,"status":{},"statusText":"{}","body":{},"headers":{}}}"#,
+                        status, status_text, body_json, headers_json
                     ))
                 }
                 Err(e) => {

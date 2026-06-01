@@ -507,8 +507,36 @@ impl JsEngine {
     /// Setup misc Web APIs: atob, btoa, matchMedia, localStorage, sessionStorage
     pub fn setup_misc(&mut self) -> Result<()> {
         let code = r#"
-        globalThis.atob = function(s) { return s; };
-        globalThis.btoa = function(s) { return s; };
+        // Base64 encode/decode (atob/btoa)
+        globalThis.atob = function(s) {
+            var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            var result = '';
+            for (var i = 0; i < s.length; i += 4) {
+                var c1 = s.charAt(i), c2 = s.charAt(i+1), c3 = s.charAt(i+2), c4 = s.charAt(i+3);
+                var a = chars.indexOf(c1);
+                var b = c2 === '=' ? 0 : chars.indexOf(c2);
+                var c = c3 === '=' ? 0 : chars.indexOf(c3);
+                var d = c4 === '=' ? 0 : chars.indexOf(c4);
+                result += String.fromCharCode((a << 2) | (b >> 4));
+                if (c3 !== '=') result += String.fromCharCode(((b & 15) << 4) | (c >> 2));
+                if (c4 !== '=') result += String.fromCharCode(((c & 3) << 6) | d);
+            }
+            return result;
+        };
+        globalThis.btoa = function(s) {
+            var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            var result = '';
+            for (var i = 0; i < s.length; i += 3) {
+                var a = s.charCodeAt(i);
+                var b = s.charCodeAt(i + 1) || 0;
+                var c = s.charCodeAt(i + 2) || 0;
+                result += chars.charAt(a >> 2);
+                result += chars.charAt(((a & 3) << 4) | (b >> 4));
+                result += i + 1 < s.length ? chars.charAt(((b & 15) << 2) | (c >> 6)) : '=';
+                result += i + 2 < s.length ? chars.charAt(c & 63) : '=';
+            }
+            return result;
+        };
         globalThis.matchMedia = function(query) {
             return {
                 matches: false,
@@ -659,6 +687,58 @@ impl JsEngine {
         }
     }
 
+    /// Serialize innerHTML: child nodes as HTML string
+    fn serialize_inner_html(tree: &DomTree, node_id: NodeId) -> String {
+        let mut buf = String::new();
+        let node = tree.get_node(node_id);
+        let mut child = node.first_child;
+        while let Some(cid) = child {
+            Self::serialize_node_html(tree, cid, &mut buf);
+            child = tree.get_node(cid).next_sibling;
+        }
+        buf
+    }
+
+    fn serialize_node_html(tree: &DomTree, node_id: NodeId, buf: &mut String) {
+        let node = tree.get_node(node_id);
+        match &node.kind {
+            NodeKind::Element(el) => {
+                buf.push('<');
+                buf.push_str(&el.tag_name.to_lowercase());
+                for attr in el.attributes.iter() {
+                    buf.push(' ');
+                    buf.push_str(&attr.name);
+                    buf.push_str("=\"");
+                    buf.push_str(&attr.value.replace('"', "&quot;"));
+                    buf.push('"');
+                }
+                buf.push('>');
+                // Children
+                let mut child = node.first_child;
+                while let Some(cid) = child {
+                    Self::serialize_node_html(tree, cid, buf);
+                    child = tree.get_node(cid).next_sibling;
+                }
+                // Closing tag (skip void elements)
+                let void_tags = ["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"];
+                if !void_tags.contains(&el.tag_name.to_lowercase().as_str()) {
+                    buf.push_str("</");
+                    buf.push_str(&el.tag_name.to_lowercase());
+                    buf.push('>');
+                }
+            }
+            NodeKind::Text(t) => {
+                buf.push_str(&t.data);
+            }
+            NodeKind::Comment(c) => {
+                buf.push_str("<!--");
+                buf.push_str(&c.data);
+                buf.push_str("-->");
+            }
+            _ => {}
+        }
+    }
+
     /// Serialize a single element node into a JS object literal string.
     /// Returns (element_literal, property_definitions) where property_definitions
     /// are Object.defineProperty calls for textContent/innerHTML.
@@ -673,6 +753,7 @@ impl JsEngine {
         let id = el.attributes.get_value("id").unwrap_or("");
         let class_name = el.class_list.join(" ");
         let text = Self::escape_js_string(&Self::serialize_text_content(tree, node_id));
+        let inner_html = Self::escape_js_string(&Self::serialize_inner_html(tree, node_id));
 
         // Collect child element node IDs
         let child_ids: Vec<u64> = tree.children(node_id)
@@ -727,11 +808,12 @@ impl JsEngine {
         let nid = node_id.data().as_ffi();
 
         let element_literal = format!(
-            r#"{{tagName:"{tag}",id:{id},className:{cls},_nodeId:{nid},_textContent:{txt},_innerHTML:"",getAttribute:function(n){{return this._attrs[n]||null}},setAttribute:function(n,v){{this._attrs[n]=String(v);__mut_set_attr__(this._nodeId,n,String(v))}},removeAttribute:function(n){{delete this._attrs[n];__mut_remove_attr__(this._nodeId,n)}},hasAttribute:function(n){{return n in this._attrs}},remove:function(){{if(this.parentNode!==null){{__mut_remove_child__(this.parentNode,this._nodeId)}}}},style:{style},_attrs:{attrs},children:{children},childNodes:{child_nodes},parentNode:{parent}}}"#,
+            r#"{{tagName:"{tag}",id:{id},className:{cls},_nodeId:{nid},_textContent:{txt},_innerHTML:{inner_html},getAttribute:function(n){{return this._attrs[n]||null}},setAttribute:function(n,v){{this._attrs[n]=String(v);__mut_set_attr__(this._nodeId,n,String(v))}},removeAttribute:function(n){{delete this._attrs[n];__mut_remove_attr__(this._nodeId,n)}},hasAttribute:function(n){{return n in this._attrs}},remove:function(){{if(this.parentNode!==null){{__mut_remove_child__(this.parentNode,this._nodeId)}}}},style:{style},_attrs:{attrs},children:{children},childNodes:{child_nodes},parentNode:{parent}}}"#,
             tag = tag.to_uppercase(),
             id = Self::escape_js_string(id),
             cls = Self::escape_js_string(&class_name),
             txt = text,
+            inner_html = inner_html,
             nid = nid,
             style = style_js,
             attrs = attrs_js,
@@ -748,6 +830,21 @@ impl JsEngine {
         ));
         prop_defs.push(format!(
             r#"Object.defineProperty(__dom_elements__[{nid}],'innerHTML',{{get:function(){{return this._innerHTML}},set:function(v){{this._innerHTML=String(v);__mut_set_inner_html__({nid},String(v))}},enumerable:true,configurable:true}})"#,
+            nid = nid
+        ));
+
+        // Add common HTML attribute getters (href, src, alt, title, value, etc.)
+        prop_defs.push(format!(
+            r#"(function(el) {{
+                var attrGetters = {{href:1,src:1,alt:1,title:1,value:1,type:1,name:1,action:1,method:1,target:1,rel:1,placeholder:1}};
+                Object.keys(attrGetters).forEach(function(k) {{
+                    Object.defineProperty(el, k, {{
+                        get: function() {{ return this._attrs[k] || ''; }},
+                        set: function(v) {{ this._attrs[k] = String(v); }},
+                        enumerable: true, configurable: true
+                    }});
+                }});
+            }})(__dom_elements__[{nid}])"#,
             nid = nid
         ));
 

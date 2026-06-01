@@ -68,6 +68,8 @@ impl Page {
         }
 
         // 4. Set up JS engine with the page context
+        // Clean up old XHR instances to prevent memory leaks
+        mb_js::xhr::clear_xhr_instances();
         self.js = JsEngine::new_with_defaults();
         self.js.setup_location(url)?;
 
