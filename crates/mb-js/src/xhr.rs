@@ -320,6 +320,68 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         })?;
         globals.set("_xhr_get_all_response_headers", _xhr_get_all_response_headers)?;
 
+        // _native_fetch(method, url, body) -> {ok, status, statusText, body, headers}
+        let _native_fetch = Function::new(ctx.clone(), |args: Rest<Value>| -> rquickjs::Result<String> {
+            let method = val_to_string(args.get(0)).unwrap_or_else(|| "GET".to_string());
+            let url = val_to_string(args.get(1)).unwrap_or_default();
+            let body_str = val_to_string(args.get(2)).unwrap_or_default();
+
+            let http_method = match method.to_uppercase().as_str() {
+                "POST" => Method::Post,
+                "PUT" => Method::Put,
+                "DELETE" => Method::Delete,
+                "HEAD" => Method::Head,
+                "OPTIONS" => Method::Options,
+                "PATCH" => Method::Patch,
+                _ => Method::Get,
+            };
+
+            let mut request = HttpRequest::new(http_method, &url);
+            if !body_str.is_empty() {
+                request = request.body(body_str.into_bytes());
+            }
+
+            let result = XHR_RUNTIME.with(|r| {
+                let handle_opt = r.borrow();
+                if let Some(handle) = handle_opt.as_ref() {
+                    XHR_CLIENT.with(|c| {
+                        let client_opt = c.borrow();
+                        if let Some(client) = client_opt.as_ref() {
+                            let client = Arc::clone(client);
+                            tokio::task::block_in_place(|| {
+                                handle.block_on(async move { client.execute(request).await })
+                            })
+                        } else {
+                            Err(anyhow!("HTTP client not initialized"))
+                        }
+                    })
+                } else {
+                    Err(anyhow!("Tokio runtime handle not available"))
+                }
+            });
+
+            match result {
+                Ok(response) => {
+                    let status = response.status_code();
+                    let text = response.text().unwrap_or_default();
+                    let mut hdrs = String::new();
+                    for (name, value) in response.headers.iter() {
+                        hdrs.push_str(&format!("{}:{}\n", name, value.to_str().unwrap_or("")));
+                    }
+                    // Return JSON with all response data
+                    let body_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
+                    Ok(format!(r#"{{"ok":true,"status":{},"statusText":"{}","body":{},"headers":{{}}}}"#,
+                        status, status, body_json
+                    ))
+                }
+                Err(e) => {
+                    Ok(format!(r#"{{"ok":false,"status":0,"statusText":"{}","body":"","headers":{{}}}}"#,
+                        e.to_string().replace('"', "'")))
+                }
+            }
+        })?;
+        globals.set("_native_fetch", _native_fetch)?;
+
         // Inject XMLHttpRequest class via eval
         let _: () = ctx.eval(r#"
         function XMLHttpRequest() {
@@ -357,6 +419,42 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         XMLHttpRequest.prototype.getResponseHeader = function(name) { return _xhr_get_response_header(this._id, name); };
         XMLHttpRequest.prototype.getAllResponseHeaders = function() { return _xhr_get_all_response_headers(this._id); };
         globalThis.XMLHttpRequest = XMLHttpRequest;
+
+        // fetch() — synchronous implementation wrapped in Promise
+        // _native_fetch(method, url, body) returns {ok, status, statusText, body, headers}
+        globalThis.fetch = function(url, options) {
+            var method = (options && options.method) || 'GET';
+            var body = (options && options.body) || '';
+            var result = _native_fetch(method, url, body);
+            return new Promise(function(resolve, reject) {
+                if (result.ok) {
+                    resolve({
+                        ok: true,
+                        status: result.status,
+                        statusText: result.statusText,
+                        url: url,
+                        _body: result.body,
+                        _headers: result.headers,
+                        json: function() { return JSON.parse(this._body); },
+                        text: function() { return this._body; },
+                        blob: function() { return this._body; },
+                        arrayBuffer: function() { return this._body; },
+                        headers: {
+                            get: function(name) {
+                                var h = this._headers || {};
+                                return h[name.toLowerCase()] || null;
+                            },
+                            has: function(name) {
+                                var h = this._headers || {};
+                                return h.hasOwnProperty(name.toLowerCase());
+                            }
+                        }
+                    });
+                } else {
+                    reject(new Error('fetch failed: ' + result.statusText));
+                }
+            });
+        };
         "#)?;
 
         Ok(())
