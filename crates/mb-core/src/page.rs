@@ -88,14 +88,49 @@ impl Page {
             }
         }
 
-        // 6. Collect and optionally execute inline scripts
+        // 6. Collect and execute scripts (inline + external)
         let scripts = HtmlParser::collect_scripts(&self.dom);
         for script in &scripts {
             if let Some(inline) = &script.inline_content {
                 tracing::debug!("Executing inline script ({} bytes)", inline.len());
-                // Execute inline scripts but don't fail the page load if they error
                 if let Err(e) = self.js.eval(inline) {
                     tracing::warn!("Inline script error: {}", e);
+                }
+            } else if let Some(src) = &script.src {
+                // Download and execute external script
+                let script_url = if src.starts_with("http") {
+                    src.clone()
+                } else if src.starts_with("//") {
+                    format!("https:{}", src)
+                } else if src.starts_with('/') {
+                    // Absolute path — construct from base URL
+                    let base = url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("https://example.com").unwrap());
+                    format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), src)
+                } else {
+                    // Relative path
+                    let base = url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("https://example.com").unwrap());
+                    let resolved = base.join(src).unwrap_or_else(|_| base.clone());
+                    resolved.to_string()
+                };
+
+                tracing::debug!("Downloading external script: {}", script_url);
+                match self.client.get(&script_url).await {
+                    Ok(response) => {
+                        if response.is_success() {
+                            match response.text() {
+                                Ok(code) => {
+                                    tracing::debug!("Executing external script ({} bytes)", code.len());
+                                    if let Err(e) = self.js.eval(&code) {
+                                        tracing::warn!("External script error: {}", e);
+                                    }
+                                }
+                                Err(e) => tracing::warn!("Failed to read script body: {}", e),
+                            }
+                        } else {
+                            tracing::warn!("Script fetch failed: HTTP {} for {}", response.status_code(), script_url);
+                        }
+                    }
+                    Err(e) => tracing::warn!("Script download error: {}", e),
                 }
             }
         }
