@@ -504,7 +504,7 @@ impl JsEngine {
         Ok(())
     }
 
-    /// Setup misc Web APIs: atob, btoa, matchMedia (stubs)
+    /// Setup misc Web APIs: atob, btoa, matchMedia, localStorage, sessionStorage
     pub fn setup_misc(&mut self) -> Result<()> {
         let code = r#"
         globalThis.atob = function(s) { return s; };
@@ -521,6 +521,33 @@ impl JsEngine {
                 dispatchEvent: function() { return true; }
             };
         };
+
+        // localStorage — in-memory key-value store (persists within session)
+        (function() {
+            var _store = {};
+            globalThis.localStorage = {
+                getItem: function(key) { return _store.hasOwnProperty(key) ? _store[key] : null; },
+                setItem: function(key, value) { _store[key] = String(value); },
+                removeItem: function(key) { delete _store[key]; },
+                clear: function() { _store = {}; },
+                get length() { return Object.keys(_store).length; },
+                key: function(index) { return Object.keys(_store)[index] || null; }
+            };
+        })();
+
+        // sessionStorage — in-memory key-value store (per-tab, cleared on close)
+        (function() {
+            var _store = {};
+            globalThis.sessionStorage = {
+                getItem: function(key) { return _store.hasOwnProperty(key) ? _store[key] : null; },
+                setItem: function(key, value) { _store[key] = String(value); },
+                removeItem: function(key) { delete _store[key]; },
+                clear: function() { _store = {}; },
+                get length() { return Object.keys(_store).length; },
+                key: function(index) { return Object.keys(_store)[index] || null; }
+            };
+        })();
+
         globalThis.window = globalThis;
         "#;
 
