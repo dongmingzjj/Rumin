@@ -14,3 +14,5 @@ mb-network = { path = "../mb-network" }
 rquickjs = { version = "0.12", features = ["full"] }
 slotmap = "1.1"
 url = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

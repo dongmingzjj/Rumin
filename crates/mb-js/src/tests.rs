@@ -328,3 +328,201 @@ fn test_webdriver() {
     let result = engine.eval("navigator.webdriver").unwrap();
     assert_eq!(result, "false");
 }
+
+#[test]
+fn test_get_computed_style() {
+    let mut engine = JsEngine::new_with_defaults();
+
+    // getComputedStyle should exist
+    assert_eq!(engine.eval("typeof getComputedStyle").unwrap(), "function");
+
+    // Should return an object with getPropertyValue
+    assert_eq!(engine.eval("typeof getComputedStyle({}).getPropertyValue").unwrap(), "function");
+
+    // Should return reasonable defaults
+    assert_eq!(engine.eval("getComputedStyle({}).getPropertyValue('display')").unwrap(), "block");
+    assert_eq!(engine.eval("getComputedStyle({}).getPropertyValue('position')").unwrap(), "static");
+    assert_eq!(engine.eval("getComputedStyle({}).getPropertyValue('font-size')").unwrap(), "16px");
+    assert_eq!(engine.eval("getComputedStyle({}).getPropertyValue('color')").unwrap(), "rgb(0, 0, 0)");
+    assert_eq!(engine.eval("getComputedStyle({}).getPropertyValue('opacity')").unwrap(), "1");
+
+    // getPropertyValue for unknown prop should return empty string
+    assert_eq!(engine.eval("getComputedStyle({}).getPropertyValue('nonexistent')").unwrap(), "");
+}
+
+#[test]
+fn test_canvas_context() {
+    use mb_dom::tree::DomTree;
+
+    let mut engine = JsEngine::new_with_defaults();
+
+    // Create a DOM with a canvas element and test getContext
+    let mut dom = DomTree::new();
+    let canvas_id = dom.create_element("canvas");
+    dom.append_child(dom.body_node, canvas_id);
+    engine.bind_dom(&dom).unwrap();
+    engine.setup_canvas_after_dom().unwrap();
+
+    // createElement('canvas') should have getContext
+    assert_eq!(engine.eval("typeof document.createElement('canvas').getContext").unwrap(), "function");
+
+    // getContext('2d') should return an object
+    assert_eq!(engine.eval("typeof document.createElement('canvas').getContext('2d')").unwrap(), "object");
+
+    // Context should have standard methods
+    let ctx = "document.createElement('canvas').getContext('2d')";
+    assert_eq!(engine.eval(&format!("typeof {ctx}.fillRect")).unwrap(), "function");
+    assert_eq!(engine.eval(&format!("typeof {ctx}.strokeRect")).unwrap(), "function");
+    assert_eq!(engine.eval(&format!("typeof {ctx}.fillText")).unwrap(), "function");
+    assert_eq!(engine.eval(&format!("typeof {ctx}.measureText")).unwrap(), "function");
+    assert_eq!(engine.eval(&format!("typeof {ctx}.toDataURL")).unwrap(), "function");
+
+    // measureText should return width/height
+    assert_eq!(engine.eval(&format!("{ctx}.measureText('hello').height")).unwrap(), "16");
+
+    // toDataURL should return a data URL
+    let data_url = engine.eval(&format!("{ctx}.toDataURL()")).unwrap();
+    assert!(data_url.starts_with("data:image/png;base64,"), "Expected PNG data URL, got: {}", data_url);
+}
+
+#[test]
+fn test_indexed_db() {
+    let mut engine = JsEngine::new_with_defaults();
+
+    // indexedDB global should exist
+    assert_eq!(engine.eval("typeof indexedDB").unwrap(), "object");
+
+    // indexedDB.open should be a function
+    assert_eq!(engine.eval("typeof indexedDB.open").unwrap(), "function");
+
+    // indexedDB.deleteDatabase should be a function
+    assert_eq!(engine.eval("typeof indexedDB.deleteDatabase").unwrap(), "function");
+
+    // Test opening a database and creating an object store
+    engine.eval(r#"
+        var _idb_db = null;
+        var _idb_req = indexedDB.open('testdb', 1);
+        _idb_req.onupgradeneeded = function(e) {
+            var db = e.target.result;
+            db.createObjectStore('users', { keyPath: 'id', autoIncrement: true });
+        };
+        _idb_req.onsuccess = function(e) {
+            _idb_db = e.target.result;
+        };
+    "#).unwrap();
+
+    // Drain timers to fire the setTimeout callbacks
+    engine.drain_and_execute_timers().unwrap();
+
+    // The database should be available now
+    let db_name = engine.eval("_idb_db ? _idb_db.name : 'null'").unwrap();
+    assert_eq!(db_name, "testdb");
+
+    // Should have the 'users' object store
+    let store_names_len = engine.eval("_idb_db.objectStoreNames.length").unwrap();
+    assert_eq!(store_names_len, "1");
+
+    // Test put and get via a transaction
+    engine.eval(r#"
+        var _idb_txn = _idb_db.transaction('users', 'readwrite');
+        var _idb_store = _idb_txn.objectStore('users');
+        _idb_store.put({ id: 1, name: 'Alice' });
+        _idb_store.put({ id: 2, name: 'Bob' });
+        var _idb_get_result = null;
+        var _idb_get_req = _idb_store.get(1);
+        _idb_get_req.onsuccess = function(e) { _idb_get_result = e.target.result; };
+    "#).unwrap();
+
+    // Drain timers for the async onsuccess
+    engine.drain_and_execute_timers().unwrap();
+
+    let name = engine.eval("_idb_get_result ? _idb_get_result.name : 'null'").unwrap();
+    assert_eq!(name, "Alice");
+
+    // Test getAll
+    engine.eval(r#"
+        var _idb_all_result = null;
+        var _idb_all_req = _idb_store.getAll();
+        _idb_all_req.onsuccess = function(e) { _idb_all_result = e.target.result; };
+    "#).unwrap();
+    engine.drain_and_execute_timers().unwrap();
+
+    let all_len = engine.eval("_idb_all_result ? _idb_all_result.length : 0").unwrap();
+    assert_eq!(all_len, "2");
+
+    // Test delete
+    engine.eval(r#"
+        _idb_store.delete(1);
+        var _idb_after_del = null;
+        var _idb_del_req = _idb_store.get(1);
+        _idb_del_req.onsuccess = function(e) { _idb_after_del = e.target.result; };
+    "#).unwrap();
+    engine.drain_and_execute_timers().unwrap();
+
+    let after_del = engine.eval("typeof _idb_after_del").unwrap();
+    assert_eq!(after_del, "undefined");
+
+    // Test clear
+    engine.eval(r#"
+        _idb_store.clear();
+        var _idb_after_clear = null;
+        var _idb_clear_req = _idb_store.getAll();
+        _idb_clear_req.onsuccess = function(e) { _idb_after_clear = e.target.result; };
+    "#).unwrap();
+    engine.drain_and_execute_timers().unwrap();
+
+    let clear_len = engine.eval("_idb_after_clear ? _idb_after_clear.length : -1").unwrap();
+    assert_eq!(clear_len, "0");
+
+    // Test deleteDatabase
+    engine.eval(r#"
+        var _idb_del_db_result = null;
+        var _idb_del_db_req = indexedDB.deleteDatabase('testdb');
+        _idb_del_db_req.onsuccess = function(e) { _idb_del_db_result = 'deleted'; };
+    "#).unwrap();
+    engine.drain_and_execute_timers().unwrap();
+
+    assert_eq!(engine.eval("_idb_del_db_result").unwrap(), "deleted");
+}
+
+#[test]
+fn test_websocket_constructor() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut engine = JsEngine::new_with_defaults();
+    rt.block_on(async {
+        engine.setup_websocket().unwrap();
+    });
+
+    // WebSocket should be a global constructor
+    assert_eq!(engine.eval("typeof WebSocket").unwrap(), "function");
+
+    // WebSocket constants should exist
+    assert_eq!(engine.eval("WebSocket.CONNECTING").unwrap(), "0");
+    assert_eq!(engine.eval("WebSocket.OPEN").unwrap(), "1");
+    assert_eq!(engine.eval("WebSocket.CLOSING").unwrap(), "2");
+    assert_eq!(engine.eval("WebSocket.CLOSED").unwrap(), "3");
+
+    // SSRF protection: creating a WebSocket to a private IP should immediately set CLOSED
+    let result = engine.eval(r#"
+        (function() {
+            var ws = new WebSocket('ws://127.0.0.1:8080');
+            return ws.readyState;
+        })()
+    "#).unwrap();
+    assert_eq!(result, "3"); // CLOSED
+
+    // WebSocket instance should have expected properties
+    let result = engine.eval(r#"
+        (function() {
+            var ws = new WebSocket('wss://example.com');
+            var props = ['url', 'readyState', 'bufferedAmount', 'extensions', 'protocol', 'binaryType',
+                         'onopen', 'onmessage', 'onerror', 'onclose', 'send', 'close'];
+            var missing = [];
+            for (var i = 0; i < props.length; i++) {
+                if (!(props[i] in ws)) missing.push(props[i]);
+            }
+            return missing.length === 0 ? 'ok' : 'missing: ' + missing.join(',');
+        })()
+    "#).unwrap();
+    assert_eq!(result, "ok");
+}

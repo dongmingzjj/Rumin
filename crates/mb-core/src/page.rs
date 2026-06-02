@@ -81,10 +81,16 @@ impl Page {
 
         // 5. Inject DOM tree into JS environment
         self.js.bind_dom(&self.dom)?;
+        self.js.setup_canvas_after_dom()?;
 
         // 5b. Setup XMLHttpRequest support
         if let Err(e) = self.js.setup_xhr(Arc::clone(&self.client)) {
             tracing::warn!("Failed to setup XHR: {}", e);
+        }
+
+        // 5c. Setup WebSocket support
+        if let Err(e) = self.js.setup_websocket() {
+            tracing::warn!("Failed to setup WebSocket: {}", e);
         }
 
         // 5c. Setup CookieJar for document.cookie (shared reference)

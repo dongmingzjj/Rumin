@@ -30,6 +30,10 @@ pub mod animation;
 pub mod mutation_observer;
 pub mod intersection_observer;
 pub mod anti_detect;
+pub mod indexed_db;
+pub mod websocket;
+pub mod computed_style;
+pub mod canvas;
 
 pub use dom_bridge::{Mutation, MutationKind};
 pub use timers::PendingCallback;
@@ -215,6 +219,9 @@ impl JsEngine {
         self.setup_animation_frames()?;
         self.setup_intersection_observer()?;
         self.setup_mutation_observer()?;
+        self.setup_computed_style()?;
+        self.setup_canvas()?;
+        self.setup_indexed_db()?;
         Ok(())
     }
 
@@ -497,6 +504,12 @@ impl JsEngine {
     pub fn setup_xhr(&mut self, client: std::sync::Arc<mb_network::client::HttpClient>) -> Result<()> {
         let handle = tokio::runtime::Handle::current();
         xhr::register_xhr(&self.context, client, handle)
+    }
+
+    /// Setup WebSocket support with real network connections
+    pub fn setup_websocket(&mut self) -> Result<()> {
+        let handle = tokio::runtime::Handle::current();
+        websocket::register_websocket(&self.context, handle)
     }
 }
 
