@@ -5,7 +5,9 @@
 //! commands.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -27,7 +29,15 @@ pub struct RecordedRequest {
     pub request_body: Vec<u8>,
     pub response_status: u16,
     pub response_headers: HashMap<String, String>,
-    pub response_body: Vec<u8>,
+    /// Size of the response body in bytes (always recorded)
+    #[serde(default)]
+    pub response_body_size: usize,
+    /// Hash fingerprint of the response body (always recorded)
+    #[serde(default)]
+    pub response_body_hash: String,
+    /// Full response body (only recorded in --record-full mode, or loaded from legacy format)
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "response_body")]
+    pub response_body_full: Option<Vec<u8>>,
     /// Unix timestamp in milliseconds
     pub timestamp: u64,
 }
@@ -37,6 +47,13 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Compute a compact hash fingerprint for a byte slice (std-library only, no external deps).
+fn body_fingerprint(data: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Convert an [`http::HeaderMap`] to a plain `HashMap<String, String>`.
@@ -58,7 +75,15 @@ fn headermap_to_hashmap(headers: &http::HeaderMap) -> HashMap<String, String> {
 
 impl RecordedRequest {
     /// Build a [`RecordedRequest`] from an [`HttpRequest`] / [`HttpResponse`] pair.
-    pub fn from_parts(req: &HttpRequest, resp: &HttpResponse) -> Self {
+    pub fn from_parts(req: &HttpRequest, resp: &HttpResponse, record_full_body: bool) -> Self {
+        let body_bytes = &resp.body;
+        let body_size = body_bytes.len();
+        let body_hash = body_fingerprint(body_bytes);
+        let body_full = if record_full_body {
+            Some(body_bytes.to_vec())
+        } else {
+            None
+        };
         Self {
             method: req.method.as_str().to_string(),
             url: req.url.clone(),
@@ -66,7 +91,9 @@ impl RecordedRequest {
             request_body: req.body.clone(),
             response_status: resp.status.as_u16(),
             response_headers: headermap_to_hashmap(&resp.headers),
-            response_body: resp.body.to_vec(),
+            response_body_size: body_size,
+            response_body_hash: body_hash,
+            response_body_full: body_full,
             timestamp: now_millis(),
         }
     }
@@ -140,6 +167,9 @@ impl RecordedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     entries: Vec<RecordedRequest>,
+    /// Whether to store full response bodies (not serialized, runtime-only)
+    #[serde(skip, default)]
+    record_full_body: bool,
 }
 
 impl RequestLog {
@@ -147,12 +177,19 @@ impl RequestLog {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            record_full_body: false,
         }
+    }
+
+    /// Set whether to record full response bodies.
+    pub fn with_full_body(mut self, full: bool) -> Self {
+        self.record_full_body = full;
+        self
     }
 
     /// Record an HTTP request / response pair.
     pub fn record(&mut self, req: &HttpRequest, resp: &HttpResponse) {
-        self.entries.push(RecordedRequest::from_parts(req, resp));
+        self.entries.push(RecordedRequest::from_parts(req, resp, self.record_full_body));
     }
 
     /// Serialise the entire log to a JSON string.
@@ -165,7 +202,10 @@ impl RequestLog {
     pub fn from_json(json: &str) -> Result<Self> {
         let entries: Vec<RecordedRequest> =
             serde_json::from_str(json).context("failed to parse RequestLog JSON")?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            record_full_body: false,
+        })
     }
 
     /// Render every entry as a `curl` command.
@@ -270,5 +310,62 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         assert!(cmds[0].contains("curl"));
         assert!(cmds[0].contains("https://example.com/"));
+    }
+
+    #[test]
+    fn compact_mode_omits_full_body() {
+        let (req, resp) = sample_pair();
+        let mut log = RequestLog::new(); // compact mode (default)
+        log.record(&req, &resp);
+
+        let entry = &log.entries()[0];
+        assert_eq!(entry.response_body_size, 14); // b"<h1>Hello</h1>".len()
+        assert!(!entry.response_body_hash.is_empty());
+        assert!(entry.response_body_full.is_none());
+
+        // JSON should not contain the full body array, only size + hash
+        let json = log.to_json();
+        assert!(!json.contains("response_body_full"));
+        assert!(json.contains("response_body_size"));
+        assert!(json.contains("response_body_hash"));
+    }
+
+    #[test]
+    fn full_mode_stores_body() {
+        let (req, resp) = sample_pair();
+        let mut log = RequestLog::new().with_full_body(true);
+        log.record(&req, &resp);
+
+        let entry = &log.entries()[0];
+        assert_eq!(entry.response_body_size, 14);
+        assert!(entry.response_body_full.is_some());
+        assert_eq!(entry.response_body_full.as_ref().unwrap(), b"<h1>Hello</h1>");
+    }
+
+    #[test]
+    fn backward_compat_old_format_with_response_body() {
+        // Simulate old format JSON that has "response_body" field
+        let old_json = r#"[
+            {
+                "method": "GET",
+                "url": "https://example.com/",
+                "request_headers": {},
+                "request_body": [],
+                "response_status": 200,
+                "response_headers": {},
+                "response_body": [60, 104, 49, 62, 72, 101, 108, 108, 111, 60, 47, 104, 49, 62],
+                "timestamp": 1234567890
+            }
+        ]"#;
+        let log = RequestLog::from_json(old_json).unwrap();
+        assert_eq!(log.entries().len(), 1);
+        let entry = &log.entries()[0];
+        assert_eq!(entry.method, "GET");
+        // Old "response_body" should be loaded into response_body_full via alias
+        assert!(entry.response_body_full.is_some());
+        assert_eq!(entry.response_body_full.as_ref().unwrap().len(), 14);
+        // New fields default to empty/zero
+        assert_eq!(entry.response_body_size, 0);
+        assert!(entry.response_body_hash.is_empty());
     }
 }

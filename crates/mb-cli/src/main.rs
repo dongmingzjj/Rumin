@@ -45,6 +45,10 @@ enum Commands {
         #[arg(long)]
         record: Option<String>,
 
+        /// Record full response bodies (makes the recording file much larger)
+        #[arg(long)]
+        record_full: bool,
+
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -74,6 +78,7 @@ async fn main() -> Result<()> {
             source,
             dom,
             record,
+            record_full,
             verbose,
         } => {
             // Set up logging
@@ -87,7 +92,9 @@ async fn main() -> Result<()> {
 
             // Create browser (with optional request logging)
             let log: Option<Arc<Mutex<RequestLog>>> = if record.is_some() {
-                Some(Arc::new(Mutex::new(RequestLog::new())))
+                Some(Arc::new(Mutex::new(
+                    RequestLog::new().with_full_body(record_full),
+                )))
             } else {
                 None
             };
