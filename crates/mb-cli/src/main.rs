@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
 
             // Save recorded requests if --record was specified
             if let (Some(path), Some(ref log)) = (&record, &log) {
-                let log = log.lock().unwrap();
+                let log = log.lock().unwrap_or_else(|e| e.into_inner());
                 log.save(path)?;
                 eprintln!("Recorded {} request(s) to {}", log.entries().len(), path);
             }

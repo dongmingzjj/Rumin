@@ -53,6 +53,24 @@ impl EmulationPreset {
             Self::Safari18 => Emulation::Safari18,
         }
     }
+
+    /// Get the user-agent string matching this emulation preset
+    pub fn user_agent(self) -> &'static str {
+        match self {
+            Self::Chrome136 => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            Self::Chrome120 => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            Self::Firefox136 => "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            Self::Safari18 => "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        }
+    }
+
+    /// Get the navigator.platform value matching this emulation preset
+    pub fn platform(self) -> &'static str {
+        match self {
+            Self::Chrome136 | Self::Safari18 => "MacIntel",
+            Self::Chrome120 | Self::Firefox136 => "Win32",
+        }
+    }
 }
 
 /// Configuration for the HTTP client

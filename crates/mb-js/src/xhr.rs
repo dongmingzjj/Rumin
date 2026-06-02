@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -14,6 +15,51 @@ use rquickjs::function::Rest;
 use mb_network::client::HttpClient;
 use mb_network::request::{HttpRequest, Method};
 use tokio::runtime::Handle;
+
+/// Check if an IP address string belongs to a private/internal network range.
+/// Only checks literal IP addresses (not hostnames/DNS names).
+fn is_private_ip(ip_str: &str) -> bool {
+    let ip_str = ip_str.trim();
+    // Strip IPv6 brackets if present
+    let stripped;
+    let ip_str = if ip_str.starts_with('[') && ip_str.ends_with(']') {
+        stripped = &ip_str[1..ip_str.len() - 1];
+        stripped
+    } else {
+        ip_str
+    };
+    let ip: IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()                          // 127.0.0.0/8
+                || v4.is_private()                     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()                  // 169.254.0.0/16
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()                           // ::1
+                || {
+                    let octets = v6.octets();
+                    // fc00::/7 (unique local addresses)
+                    (octets[0] & 0xfe) == 0xfc
+                }
+                || v6.is_unicast_link_local()          // fe80::/10
+        }
+    }
+}
+
+/// Check if a URL targets a private/internal IP address.
+/// Returns true only if the host is a literal IP in a private range.
+fn url_targets_private_ip(url_str: &str) -> bool {
+    if let Ok(parsed) = url::Url::parse(url_str) {
+        if let Some(host) = parsed.host_str() {
+            return is_private_ip(host);
+        }
+    }
+    false
+}
 
 // Thread-local storage for the HTTP client and runtime handle
 thread_local! {
@@ -167,6 +213,19 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
             });
 
             if method.is_empty() || url.is_empty() {
+                return Ok(false);
+            }
+
+            // SSRF protection: reject requests to private/internal IP addresses
+            if url_targets_private_ip(&url) {
+                XHR_INSTANCES.with(|inst| {
+                    if let Some(s) = inst.borrow_mut().get_mut(&id) {
+                        s.status = 0;
+                        s.status_text = "Blocked".to_string();
+                        s.response_text = "SSRF blocked: request to private IP address".to_string();
+                        s.ready_state = 4;
+                    }
+                });
                 return Ok(false);
             }
 
@@ -351,6 +410,17 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
                 request = request.body(body_str.into_bytes());
             }
 
+            // SSRF protection: reject requests to private/internal IP addresses
+            if url_targets_private_ip(&url) {
+                return Ok(serde_json::json!({
+                    "ok": false,
+                    "status": 0,
+                    "statusText": "SSRF blocked: request to private IP address",
+                    "body": "",
+                    "headers": {}
+                }).to_string());
+            }
+
             let result = XHR_RUNTIME.with(|r| {
                 let handle_opt = r.borrow();
                 if let Some(handle) = handle_opt.as_ref() {
@@ -375,22 +445,30 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
                     let status = response.status_code();
                     let status_text = response.status.canonical_reason().unwrap_or("Unknown").to_string();
                     let text = response.text().unwrap_or_default();
-                    // Build headers JSON object
-                    let mut hdrs = Vec::new();
+                    // Build headers as a serde_json Map for proper JSON escaping
+                    let mut hdrs = serde_json::Map::new();
                     for (name, value) in response.headers.iter() {
-                        let k = serde_json::to_string(name.as_str()).unwrap_or_default();
-                        let v = serde_json::to_string(value.to_str().unwrap_or("")).unwrap_or_default();
-                        hdrs.push(format!("{}:{}", k, v));
+                        hdrs.insert(
+                            name.as_str().to_string(),
+                            serde_json::Value::String(value.to_str().unwrap_or("").to_string()),
+                        );
                     }
-                    let headers_json = format!("{{{}}}", hdrs.join(","));
-                    let body_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
-                    Ok(format!(r#"{{"ok":true,"status":{},"statusText":"{}","body":{},"headers":{}}}"#,
-                        status, status_text, body_json, headers_json
-                    ))
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": status,
+                        "statusText": status_text,
+                        "body": text,
+                        "headers": hdrs
+                    }).to_string())
                 }
                 Err(e) => {
-                    Ok(format!(r#"{{"ok":false,"status":0,"statusText":"{}","body":"","headers":{{}}}}"#,
-                        e.to_string().replace('"', "'")))
+                    Ok(serde_json::json!({
+                        "ok": false,
+                        "status": 0,
+                        "statusText": e.to_string(),
+                        "body": "",
+                        "headers": {}
+                    }).to_string())
                 }
             }
         })?;

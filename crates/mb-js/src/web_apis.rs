@@ -71,10 +71,21 @@ impl JsEngine {
 
     /// Setup navigator object — set as a true global property.
     pub fn setup_navigator(&mut self) -> Result<()> {
-        let code = r#"
-        globalThis.navigator = {
-            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-            platform: 'MacIntel',
+        self.setup_navigator_with_overrides(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "MacIntel",
+        )
+    }
+
+    /// Setup navigator object with custom user-agent and platform.
+    pub fn setup_navigator_with_overrides(&mut self, user_agent: &str, platform: &str) -> Result<()> {
+        // Build the JS code with properly escaped user-agent and platform strings
+        let ua_json = serde_json::to_string(user_agent).unwrap_or_else(|_| "\"\"".to_string());
+        let plat_json = serde_json::to_string(platform).unwrap_or_else(|_| "\"\"".to_string());
+        let code = format!(r#"
+        globalThis.navigator = {{
+            userAgent: {ua_json},
+            platform: {plat_json},
             language: 'en-US',
             languages: ['en-US', 'en'],
             cookieEnabled: true,
@@ -84,15 +95,15 @@ impl JsEngine {
             deviceMemory: 8,
             hardwareConcurrency: 8,
             plugins: [
-                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+                {{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }},
+                {{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' }},
+                {{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }}
             ],
             mimeTypes: []
-        };
+        }};
         globalThis.navigator.plugins.length = 3;
         globalThis.window = globalThis;
-        "#;
+        "#);
 
         self.context.with(|ctx| -> rquickjs::Result<()> {
             let _: Value = ctx.eval(code)?;

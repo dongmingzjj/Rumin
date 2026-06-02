@@ -71,6 +71,11 @@ impl Page {
         // Clean up old XHR instances to prevent memory leaks
         mb_js::xhr::clear_xhr_instances();
         self.js = JsEngine::new_with_defaults();
+
+        // Apply emulation preset's user-agent and platform to navigator
+        let preset = self.client.config().emulation;
+        self.js.setup_navigator_with_overrides(preset.user_agent(), preset.platform())?;
+
         self.js.setup_location(url)?;
 
         // 5. Inject DOM tree into JS environment
