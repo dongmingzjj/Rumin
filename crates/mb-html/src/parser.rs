@@ -63,7 +63,7 @@ impl HtmlParser {
         }
 
         // Process <script> tags for script info
-        Self::collect_scripts(&tree);
+        // (collect_scripts is called by callers when needed)
 
         Ok(tree)
     }

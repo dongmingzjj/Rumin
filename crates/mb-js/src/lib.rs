@@ -65,7 +65,17 @@ pub(crate) fn value_to_f64(val: &Value) -> Option<f64> {
 
 /// Extract a u64 from a Value
 pub(crate) fn value_to_u64(val: &Value) -> Option<u64> {
-    val.as_float().map(|f| f as u64)
+    if val.is_int() {
+        val.as_int().map(|i| i as u64)
+    } else {
+        val.as_float().and_then(|f| {
+            if f.is_finite() && f >= 0.0 && f <= u64::MAX as f64 {
+                Some(f as u64)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// Extract a string from a Value

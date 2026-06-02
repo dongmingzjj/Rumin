@@ -118,6 +118,7 @@ impl NodeKind {
 // ── Document ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct DocumentData {
     pub url: String,
     pub title: String,

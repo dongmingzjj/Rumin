@@ -5,6 +5,7 @@
 
 /// TLS configuration for the HTTP client
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TlsConfig {
     /// Whether to verify server certificates
     pub verify_certificates: bool,

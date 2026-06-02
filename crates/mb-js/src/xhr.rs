@@ -561,3 +561,30 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         Ok(())
     }).map_err(|e| anyhow!("Failed to register XHR: {:?}", e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ssrf_blocked_loopback() {
+        assert!(url_targets_private_ip("http://127.0.0.1/"));
+        assert!(url_targets_private_ip("http://127.0.0.1:8080/api"));
+        assert!(url_targets_private_ip("http://[::1]:8080/"));
+    }
+
+    #[test]
+    fn test_ssrf_blocked_private_ranges() {
+        assert!(url_targets_private_ip("http://10.0.0.1/"));
+        assert!(url_targets_private_ip("http://172.16.0.1/"));
+        assert!(url_targets_private_ip("http://192.168.1.1/"));
+        assert!(url_targets_private_ip("http://169.254.1.1/"));
+    }
+
+    #[test]
+    fn test_ssrf_allowed_public() {
+        assert!(!url_targets_private_ip("https://example.com/"));
+        assert!(!url_targets_private_ip("http://8.8.8.8/"));
+        assert!(!url_targets_private_ip("https://1.1.1.1/"));
+    }
+}

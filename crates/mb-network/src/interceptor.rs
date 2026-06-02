@@ -11,10 +11,74 @@ use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use base64::Engine;
+use serde::{Deserialize, Serialize, Deserializer, Serializer};
+use serde::de;
 
 use crate::request::{HttpRequest, Method};
 use crate::response::HttpResponse;
+
+// ---------------------------------------------------------------------------
+// Base64 serde helpers for Vec<u8> — supports both base64 strings and legacy
+// JSON number arrays for backward compatibility
+// ---------------------------------------------------------------------------
+
+mod base64_serde {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+
+    pub fn serialize<S>(data: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match data {
+            Some(bytes) => {
+                let encoded = STANDARD.encode(bytes);
+                serializer.serialize_str(&encoded)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Base64OrBytesVisitor;
+
+        impl<'de> de::Visitor<'de> for Base64OrBytesVisitor {
+            type Value = Option<Vec<u8>>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a base64 string or a byte array")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                STANDARD.decode(v)
+                    .map(Some)
+                    .map_err(E::custom)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    bytes.push(b);
+                }
+                Ok(Some(bytes))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+        }
+
+        deserializer.deserialize_any(Base64OrBytesVisitor)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RecordedRequest
@@ -31,6 +95,7 @@ pub struct RecordedRequest {
     #[serde(default)]
     pub request_body_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "request_body")]
+    #[serde(with = "base64_serde")]
     pub request_body_full: Option<Vec<u8>>,
     pub response_status: u16,
     pub response_headers: HashMap<String, String>,
@@ -42,6 +107,7 @@ pub struct RecordedRequest {
     pub response_body_hash: String,
     /// Full response body (only recorded in --record-full mode, or loaded from legacy format)
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "response_body")]
+    #[serde(with = "base64_serde")]
     pub response_body_full: Option<Vec<u8>>,
     /// Unix timestamp in milliseconds
     pub timestamp: u64,
@@ -483,5 +549,49 @@ mod tests {
         // New fields default to empty/zero
         assert_eq!(entry.response_body_size, 0);
         assert!(entry.response_body_hash.is_empty());
+    }
+
+    #[test]
+    fn test_base64_serialization() {
+        // Create a log with full body recording
+        let (req, resp) = sample_pair();
+        let mut log = RequestLog::new().with_full_body(true);
+        log.record(&req, &resp);
+
+        // Serialize to JSON — bodies should be base64-encoded strings
+        let json = log.to_json();
+        assert!(json.contains("\"response_body_full\""), "should have response_body_full field");
+        // Base64 of b"<h1>Hello</h1>" is "PGgxPkhlbGxvPC9oMT4="
+        assert!(json.contains("PGgxPkhlbGxvPC9oMT4="), "response body should be base64 encoded, got: {json}");
+
+        // Deserialize back — should match original bytes
+        let restored = RequestLog::from_json(&json).unwrap();
+        let entry = &restored.entries()[0];
+        assert!(entry.response_body_full.is_some());
+        assert_eq!(entry.response_body_full.as_ref().unwrap(), b"<h1>Hello</h1>");
+    }
+
+    #[test]
+    fn test_base64_backward_compat_old_array_format() {
+        // Old format: bodies stored as JSON number arrays
+        let old_json = r#"[
+            {
+                "method": "POST",
+                "url": "https://example.com/api",
+                "request_headers": {},
+                "request_body": [104, 101, 108, 108, 111],
+                "response_status": 200,
+                "response_headers": {},
+                "response_body_full": [60, 104, 49, 62, 72, 101, 108, 108, 111, 60, 47, 104, 49, 62],
+                "timestamp": 1234567890
+            }
+        ]"#;
+        let log = RequestLog::from_json(old_json).unwrap();
+        let entry = &log.entries()[0];
+        // Should correctly decode the old number array format
+        assert!(entry.response_body_full.is_some());
+        assert_eq!(entry.response_body_full.as_ref().unwrap(), b"<h1>Hello</h1>");
+        assert!(entry.request_body_full.is_some());
+        assert_eq!(entry.request_body_full.as_ref().unwrap(), b"hello");
     }
 }

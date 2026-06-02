@@ -8,7 +8,6 @@ pub struct PendingCallback {
     pub timer_id: u32,
     pub delay_ms: u32,
     pub repeating: bool,
-    pub fire_at_ms: u64,
 }
 
 impl JsEngine {
@@ -127,7 +126,6 @@ impl JsEngine {
                                 timer_id,
                                 delay_ms,
                                 repeating,
-                                fire_at_ms: 0,
                             });
                         }
                     }
