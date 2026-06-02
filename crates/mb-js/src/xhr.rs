@@ -320,10 +320,11 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         globals.set("_xhr_get_all_response_headers", _xhr_get_all_response_headers)?;
 
         // _native_fetch(method, url, body) -> {ok, status, statusText, body, headers}
-        let _native_fetch = Function::new(ctx.clone(), |args: Rest<Value>| -> rquickjs::Result<String> {
+        let _native_fetch = Function::new(ctx.clone(), move |args: Rest<Value>| -> rquickjs::Result<String> {
             let method = val_to_string(args.get(0)).unwrap_or_else(|| "GET".to_string());
             let url = val_to_string(args.get(1)).unwrap_or_default();
             let body_str = val_to_string(args.get(2)).unwrap_or_default();
+            let headers_json = val_to_string(args.get(3)).unwrap_or_default();
 
             let http_method = match method.to_uppercase().as_str() {
                 "POST" => Method::Post,
@@ -336,6 +337,16 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
             };
 
             let mut request = HttpRequest::new(http_method, &url);
+            // Parse and apply custom headers from JS
+            if !headers_json.is_empty() {
+                if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&headers_json) {
+                    for (k, v) in &map {
+                        if let Some(val) = v.as_str() {
+                            request = request.header(k.as_str(), val);
+                        }
+                    }
+                }
+            }
             if !body_str.is_empty() {
                 request = request.body(body_str.into_bytes());
             }
@@ -429,7 +440,14 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         globalThis.fetch = function(url, options) {
             var method = (options && options.method) || 'GET';
             var body = (options && options.body) || '';
-            var raw = _native_fetch(method, url, body);
+            var hdrs = (options && options.headers) || null;
+            if (hdrs && typeof hdrs.entries === 'function') {
+                var obj = {};
+                hdrs.entries(function(v, k) { obj[k] = v; });
+                hdrs = obj;
+            }
+            var headersStr = hdrs ? JSON.stringify(hdrs) : '';
+            var raw = _native_fetch(method, url, body, headersStr);
             var result = JSON.parse(raw);
             return new Promise(function(resolve, reject) {
                 if (result.ok) {

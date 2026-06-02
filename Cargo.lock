@@ -1035,6 +1035,7 @@ dependencies = [
  "slotmap",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

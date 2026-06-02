@@ -82,7 +82,7 @@ impl Page {
         }
 
         // 5c. Setup CookieJar for document.cookie (shared reference)
-        if let Err(e) = self.js.set_cookie_jar(Arc::clone(&self.cookies)) {
+        if let Err(e) = self.js.set_cookie_jar(Arc::clone(&self.cookies), &self.url) {
             tracing::warn!("Failed to setup cookies: {}", e);
         }
 
