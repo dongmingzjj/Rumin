@@ -14,7 +14,7 @@ use anyhow::Result;
 use wreq_util::Emulation;
 
 use crate::cookie::CookieJar;
-use crate::request::{HttpRequest, Method};
+use crate::request::HttpRequest;
 use crate::response::HttpResponse;
 use crate::tls::TlsConfig;
 

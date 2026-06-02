@@ -6,8 +6,8 @@
 use super::*;
 use slotmap::Key;
 
-/// Thread-local storage for DOM element data (used by native querySelectorAll)
-/// Maps node_id (u64) -> (tag_name_uppercase, class_list, id_attr, parent_id)
+// Thread-local storage for DOM element data (used by native querySelectorAll)
+// Maps node_id (u64) -> (tag_name_uppercase, class_list, id_attr, parent_id)
 thread_local! {
     pub(crate) static DOM_ELEMENTS: RefCell<HashMap<u64, (String, Vec<String>, String, Option<u64>)>> = RefCell::new(HashMap::new());
 }
@@ -466,7 +466,7 @@ globalThis.document = {{
                     // For each element, check if it matches the selector
                     let engine = SelectorEngine::parse(&selector);
                     elements.iter()
-                        .filter(|(nid, (tag, classes, id, parent))| {
+                        .filter(|(_nid, (tag, classes, id, parent))| {
                             // Check each selector in the engine
                             engine.selectors.iter().any(|sel| {
                                 if sel.parts.is_empty() { return false; }

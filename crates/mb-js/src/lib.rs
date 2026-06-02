@@ -8,12 +8,12 @@
 //! - setTimeout / setInterval / clearTimeout / clearInterval (MVP)
 
 use anyhow::{Result, anyhow};
-use rquickjs::{Context as QContext, Runtime, Ctx, Value, String as JsString, Function};
+use rquickjs::{Context as QContext, Runtime, Value, Function};
 use rquickjs::function::Rest;
 use mb_dom::tree::DomTree;
 use mb_dom::node::{NodeKind, NodeId};
 use mb_dom::selector::SelectorEngine;
-use slotmap::Key;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use mb_network::cookie::CookieJar;
@@ -32,6 +32,7 @@ pub use timers::PendingCallback;
 pub struct JsEngine {
     pub(crate) runtime: Runtime,
     pub(crate) context: QContext,
+    #[allow(dead_code)]
     pub(crate) pending_callbacks: Vec<PendingCallback>,
     /// Mutations recorded by JS that need to be applied to the Rust DomTree.
     pub mutations: Vec<Mutation>,

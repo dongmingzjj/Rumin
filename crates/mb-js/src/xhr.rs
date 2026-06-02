@@ -15,7 +15,7 @@ use mb_network::client::HttpClient;
 use mb_network::request::{HttpRequest, Method};
 use tokio::runtime::Handle;
 
-/// Thread-local storage for the HTTP client and runtime handle
+// Thread-local storage for the HTTP client and runtime handle
 thread_local! {
     static XHR_CLIENT: RefCell<Option<Arc<HttpClient>>> = RefCell::new(None);
     static XHR_RUNTIME: RefCell<Option<Handle>> = RefCell::new(None);
@@ -79,11 +79,6 @@ fn val_to_string(v: Option<&Value>) -> Option<String> {
     })
 }
 
-/// Helper to extract boolean from Option<Value>
-fn val_to_bool(v: Option<&Value>) -> Option<bool> {
-    v.and_then(|v| v.as_bool())
-}
-
 /// Clear all XHR instance state (call after navigation)
 pub fn clear_xhr_instances() {
     XHR_INSTANCES.with(|inst| {
@@ -109,7 +104,8 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         })?;
         globals.set("_xhr_create", _xhr_create)?;
 
-        // _xhr_open(id, method, url) -> ()
+        // _xhr_open(id, method, url, async?) -> ()
+        // Silently accepts async=true; all requests are executed synchronously.
         let _xhr_open = Function::new(ctx.clone(), |args: Rest<Value>| -> rquickjs::Result<()> {
             let id = val_to_f64(args.get(0))
                 .ok_or(rquickjs::Error::Exception)? as u64;
@@ -118,12 +114,8 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
             let url = val_to_string(args.get(2))
                 .ok_or(rquickjs::Error::Exception)?;
 
-            // Check async flag
-            if let Some(async_val) = args.get(3) {
-                if val_to_bool(Some(async_val)).unwrap_or(true) {
-                    return Err(rquickjs::Error::Exception);
-                }
-            }
+            // async flag (args.get(3)) is intentionally ignored —
+            // we accept both sync and async XHR, executing all synchronously.
 
             XHR_INSTANCES.with(|inst| {
                 if let Some(s) = inst.borrow_mut().get_mut(&id) {
@@ -413,14 +405,15 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         };
         XMLHttpRequest.prototype.send = function(body) {
             var ok = _xhr_send(this._id, body || '');
-            if (ok) {
-                this.readyState = parseInt(_xhr_get_property(this._id, 'readyState'));
-                this.status = parseInt(_xhr_get_property(this._id, 'status'));
-                this.statusText = _xhr_get_property(this._id, 'statusText');
-                this.responseText = _xhr_get_property(this._id, 'responseText');
-                this.responseURL = _xhr_get_property(this._id, 'responseURL');
-                this.response = this.responseText;
-            }
+            // Always read response properties from native side,
+            // whether the request succeeded or failed.
+            // On error, _xhr_send still sets readyState=4, status=0, etc.
+            this.readyState = parseInt(_xhr_get_property(this._id, 'readyState'));
+            this.status = parseInt(_xhr_get_property(this._id, 'status'));
+            this.statusText = _xhr_get_property(this._id, 'statusText');
+            this.responseText = _xhr_get_property(this._id, 'responseText');
+            this.responseURL = _xhr_get_property(this._id, 'responseURL');
+            this.response = this.responseText;
             if (this.onreadystatechange) this.onreadystatechange();
             if (ok && this.onload) this.onload();
             if (!ok && this.onerror) this.onerror();
