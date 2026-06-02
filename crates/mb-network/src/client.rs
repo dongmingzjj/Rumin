@@ -7,7 +7,7 @@
 //! - TLS fingerprint emulation (Chrome via BoringSSL)
 //! - Cookie jar integration
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -152,7 +152,7 @@ impl ClientConfigBuilder {
 pub struct HttpClient {
     client: wreq::Client,
     config: ClientConfig,
-    cookie_jar: Option<Mutex<CookieJar>>,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 }
 
 impl HttpClient {
@@ -190,9 +190,9 @@ impl HttpClient {
         })
     }
 
-    /// Attach a cookie jar to this client
-    pub fn with_cookies(mut self, jar: CookieJar) -> Self {
-        self.cookie_jar = Some(Mutex::new(jar));
+    /// Attach a shared cookie jar to this client
+    pub fn with_cookies(mut self, jar: Arc<Mutex<CookieJar>>) -> Self {
+        self.cookie_jar = Some(jar);
         self
     }
 

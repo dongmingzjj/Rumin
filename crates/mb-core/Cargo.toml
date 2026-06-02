@@ -16,5 +16,3 @@ mb-network = { path = "../mb-network" }
 mb-dom = { path = "../mb-dom" }
 mb-html = { path = "../mb-html" }
 mb-js = { path = "../mb-js" }
-mb-storage = { path = "../mb-storage" }
-mb-fingerprint = { path = "../mb-fingerprint" }

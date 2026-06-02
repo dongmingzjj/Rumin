@@ -6,8 +6,6 @@ members = [
     "crates/mb-dom",
     "crates/mb-html",
     "crates/mb-js",
-    "crates/mb-storage",
-    "crates/mb-fingerprint",
     "crates/mb-cli",
 ]
 

@@ -19,23 +19,23 @@ pub struct Browser {
 impl Browser {
     /// Create a new browser with default configuration
     pub fn new() -> Result<Self> {
-        let cookies = CookieJar::new();
-        let client = HttpClient::new()?.with_cookies(cookies.clone());
+        let cookies = Arc::new(Mutex::new(CookieJar::new()));
+        let client = HttpClient::new()?.with_cookies(Arc::clone(&cookies));
 
         Ok(Self {
             client: Arc::new(client),
-            cookies: Arc::new(Mutex::new(cookies)),
+            cookies,
         })
     }
 
     /// Create a browser with custom client config
     pub fn with_config(config: ClientConfig) -> Result<Self> {
-        let cookies = CookieJar::new();
-        let client = HttpClient::with_config(config)?.with_cookies(cookies.clone());
+        let cookies = Arc::new(Mutex::new(CookieJar::new()));
+        let client = HttpClient::with_config(config)?.with_cookies(Arc::clone(&cookies));
 
         Ok(Self {
             client: Arc::new(client),
-            cookies: Arc::new(Mutex::new(cookies)),
+            cookies,
         })
     }
 
