@@ -446,6 +446,82 @@ globalThis.document = {{
         if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = el;
         return el;
     }},
+    createDocumentFragment: function() {{
+        var newId = 'created_' + (++this._createCounter);
+        var frag = {{
+            nodeType: 11, nodeName: '#document-fragment', nodeValue: null,
+            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _textContent: "", _innerHTML: "",
+            _attrs: {{}}, style: {{}}
+        }};
+        Object.setPrototypeOf(frag, __dom_element_proto__);
+        if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = frag;
+        return frag;
+    }},
+    createComment: function(data) {{
+        var newId = 'created_' + (++this._createCounter);
+        var comment = {{
+            nodeType: 8, nodeName: '#comment', nodeValue: String(data || ''),
+            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _textContent: String(data || ''), _innerHTML: "",
+            _attrs: {{}}, style: {{}}
+        }};
+        Object.setPrototypeOf(comment, __dom_element_proto__);
+        if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = comment;
+        return comment;
+    }},
+    createTextNode: function(data) {{
+        var newId = 'created_' + (++this._createCounter);
+        var text = {{
+            nodeType: 3, nodeName: '#text', nodeValue: String(data || ''),
+            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _textContent: String(data || ''), _innerHTML: "",
+            _attrs: {{}}, style: {{}}
+        }};
+        Object.setPrototypeOf(text, __dom_element_proto__);
+        if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = text;
+        return text;
+    }},
+    createRange: function() {{
+        return {{
+            selectNodeContents: function(node) {{ this._node = node; }},
+            createContextualFragment: function(html) {{
+                var frag = document.createDocumentFragment();
+                if (typeof html === 'string' && html.length > 0) {{
+                    var tmp = document.createElement('div');
+                    tmp.innerHTML = html;
+                    while (tmp.firstChild) {{
+                        frag.appendChild(tmp.firstChild);
+                    }}
+                }}
+                return frag;
+            }},
+            collapse: function() {{}},
+            selectNode: function(node) {{ this._node = node; }},
+            deleteContents: function() {{}},
+            cloneContents: function() {{ return document.createDocumentFragment(); }},
+            extractContents: function() {{ return document.createDocumentFragment(); }}
+        }};
+    }},
+    createEvent: function(type) {{
+        return {{
+            type: type || '',
+            bubbles: false,
+            cancelable: false,
+            target: null,
+            currentTarget: null,
+            defaultPrevented: false,
+            timeStamp: Date.now(),
+            initEvent: function(type, bubbles, cancelable) {{
+                this.type = type || '';
+                this.bubbles = !!bubbles;
+                this.cancelable = !!cancelable;
+            }},
+            preventDefault: function() {{ this.defaultPrevented = true; }},
+            stopPropagation: function() {{}},
+            stopImmediatePropagation: function() {{}}
+        }};
+    }},
     _createCounter: 0
 }};
 "#,
