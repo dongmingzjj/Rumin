@@ -216,27 +216,14 @@ impl HttpClient {
         self.execute(request).await
     }
 
-    /// Convert our Method enum to http::Method (used by wreq)
-    fn to_http_method(method: Method) -> http::Method {
-        match method {
-            Method::Get => http::Method::GET,
-            Method::Post => http::Method::POST,
-            Method::Put => http::Method::PUT,
-            Method::Delete => http::Method::DELETE,
-            Method::Head => http::Method::HEAD,
-            Method::Options => http::Method::OPTIONS,
-            Method::Patch => http::Method::PATCH,
-        }
-    }
-
     /// Execute a full HttpRequest
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
         let url: url::Url = request.url.parse()?;
 
-        // Build the wreq request
+        // Build the wreq request (uses From<Method> impl in request.rs)
         let mut builder = self
             .client
-            .request(Self::to_http_method(request.method), url.as_str());
+            .request(http::Method::from(request.method), url.as_str());
 
         // Add custom headers
         for (key, value) in &request.headers {

@@ -13,4 +13,4 @@ pub use client::{ClientConfig, ClientConfigBuilder, EmulationPreset, HttpClient,
 pub use cookie::{Cookie, CookieJar};
 pub use request::{HttpRequest, Method};
 pub use response::HttpResponse;
-pub use tls::{ChromeTlsFingerprint, TlsConfig};
+pub use tls::TlsConfig;
