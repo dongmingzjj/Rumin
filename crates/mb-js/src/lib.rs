@@ -30,6 +30,7 @@ pub mod animation;
 pub mod mutation_observer;
 pub mod intersection_observer;
 pub mod anti_detect;
+pub mod intl;
 pub mod indexed_db;
 pub mod websocket;
 pub mod computed_style;
@@ -184,6 +185,48 @@ fn split_last_expression(code: &str) -> (Option<String>, String) {
     }
 }
 
+/// Extract detailed exception info from the JS context after an eval error.
+/// Tries to get message, stack, fileName, lineNumber from the exception object.
+fn extract_js_exception(ctx: &rquickjs::Ctx<'_>) -> String {
+    let exc = ctx.catch();
+    if let Some(obj) = exc.as_object() {
+        let msg: String = obj
+            .get("message")
+            .ok()
+            .and_then(|v: Value| v.as_string().and_then(|s| s.to_string().ok()))
+            .unwrap_or_default();
+        let stack: String = obj
+            .get("stack")
+            .ok()
+            .and_then(|v: Value| v.as_string().and_then(|s| s.to_string().ok()))
+            .unwrap_or_default();
+        let file: String = obj
+            .get("fileName")
+            .ok()
+            .and_then(|v: Value| v.as_string().and_then(|s| s.to_string().ok()))
+            .unwrap_or_default();
+        let line: i32 = obj
+            .get("lineNumber")
+            .ok()
+            .and_then(|v: Value| v.as_int())
+            .unwrap_or(0);
+
+        if !stack.is_empty() {
+            stack
+        } else if !msg.is_empty() {
+            if !file.is_empty() && line > 0 {
+                format!("{} ({}:{})", msg, file, line)
+            } else {
+                msg
+            }
+        } else {
+            format!("{:?}", exc)
+        }
+    } else {
+        format!("{:?}", exc)
+    }
+}
+
 impl JsEngine {
     /// Create a new JS engine instance
     pub fn new() -> Self {
@@ -209,6 +252,7 @@ impl JsEngine {
         self.setup_timers()?;
         self.setup_console()?;
         self.setup_navigator()?;
+        self.setup_intl()?;
         self.setup_anti_detect()?;
         self.setup_location("about:blank")?;
         self.setup_screen()?;
@@ -245,14 +289,26 @@ impl JsEngine {
         //   → last:  "r"
         let (setup_code, last_code) = split_last_expression(code);
 
+        let js_error_detail: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
         let result_str = self.context.with(|ctx| -> rquickjs::Result<String> {
             // Phase 0: Execute setup code (everything except last expression)
             if let Some(ref setup) = setup_code {
-                ctx.eval::<(), _>(setup.as_str())?;
+                if let Err(_) = ctx.eval::<(), _>(setup.as_str()) {
+                    let detail = extract_js_exception(&ctx);
+                    *js_error_detail.borrow_mut() = Some(detail);
+                    return Err(rquickjs::Error::Exception);
+                }
             }
 
             // Phase 1: Execute the last expression
-            let val: Value = ctx.eval(last_code.as_str())?;
+            let val: Value = match ctx.eval(last_code.as_str()) {
+                Ok(v) => v,
+                Err(_) => {
+                    let detail = extract_js_exception(&ctx);
+                    *js_error_detail.borrow_mut() = Some(detail);
+                    return Err(rquickjs::Error::Exception);
+                }
+            };
 
             // Phase 2: If the return value is a Promise, drain microtasks
             // until it settles, then return the resolved value.
@@ -311,7 +367,13 @@ impl JsEngine {
             // but that's an acceptable trade-off for correctness.
             let final_val: Value = ctx.eval(last_code.as_str())?;
             Ok(js_value_to_string(&final_val))
-        }).map_err(|e| anyhow!("JS evaluation error: {:?}", e))?;
+        }).map_err(|e| {
+            if let Some(detail) = js_error_detail.borrow_mut().take() {
+                anyhow!("JS evaluation error: {}", detail)
+            } else {
+                anyhow!("JS evaluation error: {:?}", e)
+            }
+        })?;
 
         // Drain any DOM mutations that were queued during eval + microtasks
         if let Err(e) = self.drain_js_mutations() {

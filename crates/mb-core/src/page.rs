@@ -100,6 +100,9 @@ impl Page {
 
         // 6. Collect and execute scripts (inline + external)
         let scripts = HtmlParser::collect_scripts(&self.dom);
+
+        // First, execute all inline scripts immediately and collect external script URLs
+        let mut external_urls: Vec<String> = Vec::new();
         for script in &scripts {
             if let Some(inline) = &script.inline_content {
                 tracing::debug!("Executing inline script ({} bytes)", inline.len());
@@ -107,42 +110,58 @@ impl Page {
                     tracing::warn!("Inline script error: {}", e);
                 }
             } else if let Some(src) = &script.src {
-                // Download and execute external script
                 let script_url = if src.starts_with("http") {
                     src.clone()
                 } else if src.starts_with("//") {
                     format!("https:{}", src)
                 } else if src.starts_with('/') {
-                    // Absolute path — construct from base URL
                     let base = url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("https://example.com").unwrap());
                     format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), src)
                 } else {
-                    // Relative path
                     let base = url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("https://example.com").unwrap());
                     let resolved = base.join(src).unwrap_or_else(|_| base.clone());
                     resolved.to_string()
                 };
+                external_urls.push(script_url);
+            }
+        }
 
-                tracing::debug!("Downloading external script: {}", script_url);
-                match self.client.get(&script_url).await {
+        // Concurrently download all external scripts, then execute in order
+        if !external_urls.is_empty() {
+            let downloads: Vec<_> = external_urls
+                .iter()
+                .map(|url| self.client.get(url))
+                .collect();
+            let results = futures_util::future::join_all(downloads).await;
+
+            for (script_url, result) in external_urls.iter().zip(results.into_iter()) {
+                match result {
                     Ok(response) => {
                         if response.is_success() {
                             match response.text() {
                                 Ok(code) => {
-                                    tracing::debug!("Executing external script ({} bytes)", code.len());
+                                    tracing::debug!("Executing external script ({} bytes) from {}", code.len(), script_url);
                                     if let Err(e) = self.js.eval(&code) {
                                         tracing::warn!("External script error: {}", e);
                                     }
                                 }
-                                Err(e) => tracing::warn!("Failed to read script body: {}", e),
+                                Err(e) => tracing::warn!("Failed to read script body from {}: {}", script_url, e),
                             }
                         } else {
                             tracing::warn!("Script fetch failed: HTTP {} for {}", response.status_code(), script_url);
                         }
                     }
-                    Err(e) => tracing::warn!("Script download error: {}", e),
+                    Err(e) => tracing::warn!("Script download error for {}: {}", script_url, e),
                 }
             }
+        }
+
+        // Trigger DOMContentLoaded and load events for SPA framework initialization
+        if let Err(e) = self.js.eval("document.dispatchEvent(new Event('DOMContentLoaded'))") {
+            tracing::debug!("DOMContentLoaded dispatch: {}", e);
+        }
+        if let Err(e) = self.js.eval("window.dispatchEvent(new Event('load'))") {
+            tracing::debug!("load event dispatch: {}", e);
         }
 
         Ok(())

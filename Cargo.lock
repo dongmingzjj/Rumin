@@ -1078,6 +1078,7 @@ name = "mb-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "mb-dom",
  "mb-html",
  "mb-js",

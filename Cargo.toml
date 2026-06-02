@@ -31,4 +31,5 @@ thiserror = "1"
 lto = true
 codegen-units = 1
 strip = true
-opt-level = "z"
+opt-level = 3
+panic = "abort"

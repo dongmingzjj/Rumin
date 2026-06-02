@@ -94,44 +94,74 @@ impl Browser {
 
     /// Navigate multiple URLs with a concurrency limit.
     /// Each URL gets its own Page but shares HttpClient + CookieJar.
-    /// Note: Page is !Send (rquickjs), so we fall back to sequential execution.
+    /// Uses std::thread::spawn + independent tokio runtimes for true concurrency,
+    /// since Page (rquickjs) is !Send and cannot be used with tokio::spawn.
     pub async fn navigate_all(
         &self,
         urls: Vec<String>,
-        _concurrency: usize,
+        concurrency: usize,
     ) -> Vec<BatchResult> {
-        let mut results = Vec::with_capacity(urls.len());
+        let client = Arc::clone(&self.client);
+        let cookies = Arc::clone(&self.cookies);
+        let concurrency = concurrency.max(1);
+        let mut all_results = Vec::with_capacity(urls.len());
 
-        for url in urls {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                self.navigate(&url),
-            )
-            .await;
+        for chunk in urls.chunks(concurrency) {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|url| {
+                    let client = Arc::clone(&client);
+                    let cookies = Arc::clone(&cookies);
+                    let url = url.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        rt.block_on(async move {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                async {
+                                    let mut page = Page::new(client, cookies);
+                                    page.navigate(&url).await?;
+                                    Ok::<_, anyhow::Error>(page)
+                                },
+                            )
+                            .await;
 
-            match result {
-                Ok(Ok(page)) => results.push(BatchResult {
-                    url,
-                    status: page.status,
-                    title: page.dom_title(),
-                    error: None,
-                }),
-                Ok(Err(e)) => results.push(BatchResult {
-                    url,
-                    status: 0,
-                    title: String::new(),
-                    error: Some(format!("{}", e)),
-                }),
-                Err(_) => results.push(BatchResult {
-                    url,
-                    status: 0,
-                    title: String::new(),
-                    error: Some("timeout after 60s".to_string()),
-                }),
+                            match result {
+                                Ok(Ok(page)) => BatchResult {
+                                    url,
+                                    status: page.status,
+                                    title: page.dom_title(),
+                                    error: None,
+                                },
+                                Ok(Err(e)) => BatchResult {
+                                    url,
+                                    status: 0,
+                                    title: String::new(),
+                                    error: Some(format!("{}", e)),
+                                },
+                                Err(_) => BatchResult {
+                                    url,
+                                    status: 0,
+                                    title: String::new(),
+                                    error: Some("timeout after 60s".to_string()),
+                                },
+                            }
+                        })
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                if let Ok(r) = h.join() {
+                    all_results.push(r);
+                }
             }
         }
 
-        results
+        all_results
     }
 
     /// Get the cookie jar
