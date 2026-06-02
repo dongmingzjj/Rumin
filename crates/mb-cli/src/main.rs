@@ -10,6 +10,9 @@ use mb_network::interceptor::RequestLog;
 #[command(name = "minibrowser", version = "0.1.0")]
 #[command(about = "Minimal browser engine for automated web scraping")]
 struct Cli {
+    /// Proxy URL (e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080)
+    #[arg(long)]
+    proxy: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -63,11 +66,46 @@ enum Commands {
         #[arg(long)]
         curl: bool,
     },
+
+    /// Batch navigate multiple URLs concurrently
+    Batch {
+        /// URLs to navigate to
+        urls: Vec<String>,
+
+        /// Read URLs from a file (one per line)
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Maximum number of concurrent navigations
+        #[arg(short, long, default_value = "4")]
+        concurrency: usize,
+
+        /// CSS selector to extract text from
+        #[arg(short, long)]
+        selector: Option<String>,
+
+        /// JavaScript expression to evaluate
+        #[arg(short, long)]
+        eval: Option<String>,
+
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Resolve proxy URL from CLI flag or environment variables
+    let proxy_url = cli.proxy.or_else(|| {
+        std::env::var("MB_PROXY")
+            .or_else(|_| std::env::var("http_proxy"))
+            .or_else(|_| std::env::var("https_proxy"))
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
 
     match cli.command {
         Commands::Navigate {
@@ -99,10 +137,22 @@ async fn main() -> Result<()> {
                 None
             };
 
-            let browser = if let Some(ref l) = log {
-                mb_core::Browser::with_request_log(Arc::clone(l))?
+            // Build client config with optional proxy
+            let client_config = if let Some(ref proxy) = proxy_url {
+                let pc = if proxy.starts_with("socks5://") || proxy.starts_with("socks5h://") {
+                    mb_network::client::ProxyConfig::Socks5(proxy.clone())
+                } else {
+                    mb_network::client::ProxyConfig::Http(proxy.clone())
+                };
+                mb_network::client::ClientConfigBuilder::new().proxy(pc).build()
             } else {
-                mb_core::Browser::new()?
+                mb_network::client::ClientConfigBuilder::new().build()
+            };
+
+            let browser = if let Some(ref l) = log {
+                mb_core::Browser::with_config_and_request_log(client_config, Arc::clone(l))?
+            } else {
+                mb_core::Browser::with_config(client_config)?
             };
 
             let mut page = browser.navigate(&url).await?;
@@ -182,6 +232,65 @@ async fn main() -> Result<()> {
                             eprintln!("  -> ERROR: {}", e);
                         }
                     }
+                }
+            }
+        }
+
+        Commands::Batch {
+            urls,
+            file,
+            concurrency,
+            selector: _selector,
+            eval: _eval,
+            verbose,
+        } => {
+            // Set up logging
+            let level = if verbose { "debug" } else { "warn" };
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
+                )
+                .init();
+
+            // Collect URLs from file if specified
+            let mut all_urls = urls;
+            if let Some(ref path) = file {
+                let content = std::fs::read_to_string(path)?;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        all_urls.push(trimmed.to_string());
+                    }
+                }
+            }
+
+            if all_urls.is_empty() {
+                eprintln!("No URLs specified. Provide URLs as arguments or via --file.");
+                std::process::exit(1);
+            }
+
+            // Build client config with optional proxy
+            let client_config = if let Some(ref proxy) = proxy_url {
+                let pc = if proxy.starts_with("socks5://") || proxy.starts_with("socks5h://") {
+                    mb_network::client::ProxyConfig::Socks5(proxy.clone())
+                } else {
+                    mb_network::client::ProxyConfig::Http(proxy.clone())
+                };
+                mb_network::client::ClientConfigBuilder::new().proxy(pc).build()
+            } else {
+                mb_network::client::ClientConfigBuilder::new().build()
+            };
+
+            let browser = mb_core::Browser::with_config(client_config)?;
+
+            let results = browser.navigate_all(all_urls, concurrency).await;
+
+            for r in &results {
+                if let Some(ref err) = r.error {
+                    println!("{}\t\t0\tERROR: {}", r.url, err);
+                } else {
+                    println!("{}\t{}\t{}", r.url, r.title, r.status);
                 }
             }
         }

@@ -24,9 +24,10 @@ use crate::tls::TlsConfig;
 pub enum ProxyConfig {
     /// No proxy
     None,
-    /// HTTP proxy at the given URL (e.g. "http://127.0.0.1:7890")
+    /// HTTP/HTTPS proxy at the given URL (e.g. "http://127.0.0.1:7890")
     Http(String),
-    // SOCKS5 would require additional dependencies (tokio-socks)
+    /// SOCKS5 proxy at the given URL (e.g. "socks5://127.0.0.1:1080")
+    Socks5(String),
 }
 
 /// TLS fingerprint emulation preset
@@ -197,6 +198,9 @@ impl HttpClient {
         match &config.proxy {
             ProxyConfig::None => {}
             ProxyConfig::Http(url) => {
+                builder = builder.proxy(wreq::Proxy::all(url)?);
+            }
+            ProxyConfig::Socks5(url) => {
                 builder = builder.proxy(wreq::Proxy::all(url)?);
             }
         }

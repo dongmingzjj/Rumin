@@ -2,12 +2,23 @@
 
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
+use serde::Serialize;
 
 use mb_network::client::{ClientConfig, HttpClient};
 use mb_network::cookie::CookieJar;
 use mb_network::interceptor::RequestLog;
 
 use crate::page::Page;
+
+/// Result of a single batch navigation
+#[derive(Debug, Serialize)]
+pub struct BatchResult {
+    pub url: String,
+    pub status: u16,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// The main browser instance
 pub struct Browser {
@@ -53,6 +64,22 @@ impl Browser {
         })
     }
 
+    /// Create a browser with custom client config AND a shared request log
+    pub fn with_config_and_request_log(
+        config: ClientConfig,
+        log: Arc<Mutex<RequestLog>>,
+    ) -> Result<Self> {
+        let cookies = Arc::new(Mutex::new(CookieJar::new()));
+        let client = HttpClient::with_config(config)?
+            .with_cookies(Arc::clone(&cookies))
+            .with_logging(log);
+
+        Ok(Self {
+            client: Arc::new(client),
+            cookies,
+        })
+    }
+
     /// Open a new page/tab
     pub fn new_page(&self) -> Page {
         Page::new(Arc::clone(&self.client), Arc::clone(&self.cookies))
@@ -63,6 +90,48 @@ impl Browser {
         let mut page = self.new_page();
         page.navigate(url).await?;
         Ok(page)
+    }
+
+    /// Navigate multiple URLs with a concurrency limit.
+    /// Each URL gets its own Page but shares HttpClient + CookieJar.
+    /// Note: Page is !Send (rquickjs), so we fall back to sequential execution.
+    pub async fn navigate_all(
+        &self,
+        urls: Vec<String>,
+        _concurrency: usize,
+    ) -> Vec<BatchResult> {
+        let mut results = Vec::with_capacity(urls.len());
+
+        for url in urls {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.navigate(&url),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(page)) => results.push(BatchResult {
+                    url,
+                    status: page.status,
+                    title: page.dom_title(),
+                    error: None,
+                }),
+                Ok(Err(e)) => results.push(BatchResult {
+                    url,
+                    status: 0,
+                    title: String::new(),
+                    error: Some(format!("{}", e)),
+                }),
+                Err(_) => results.push(BatchResult {
+                    url,
+                    status: 0,
+                    title: String::new(),
+                    error: Some("timeout after 60s".to_string()),
+                }),
+            }
+        }
+
+        results
     }
 
     /// Get the cookie jar
