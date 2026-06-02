@@ -227,9 +227,11 @@ impl HttpClient {
 
     /// Execute a full HttpRequest
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
-        // Clone request data for logging before body is consumed
-        let request_for_log = if self.log.is_some() {
-            Some(request.clone())
+        // Extract lightweight request metadata for logging (no body clone)
+        let request_meta = if self.log.is_some() {
+            let (method, url, headers, body_size, body_hash) =
+                crate::interceptor::RecordedRequest::extract_request_meta(&request);
+            Some((method, url, headers, body_size, body_hash))
         } else {
             None
         };
@@ -289,10 +291,14 @@ impl HttpClient {
             url: request.url.clone(),
         };
 
-        // Record to request log if enabled
-        if let (Some(ref log_mutex), Some(ref logged_req)) = (&self.log, &request_for_log) {
+        // Record to request log if enabled (zero-copy: body hash only)
+        if let (Some(ref log_mutex), Some(ref meta)) = (&self.log, &request_meta) {
             if let Ok(mut log) = log_mutex.lock() {
-                log.record(logged_req, &response);
+                let entry = crate::interceptor::RecordedRequest::from_precomputed(
+                    meta.0.clone(), meta.1.clone(), meta.2.clone(),
+                    meta.3, meta.4.clone(), &response, log.record_full_body(),
+                );
+                log.record_entry(entry);
             }
         }
 

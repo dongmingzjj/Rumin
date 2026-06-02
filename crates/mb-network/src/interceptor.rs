@@ -26,7 +26,12 @@ pub struct RecordedRequest {
     pub method: String,
     pub url: String,
     pub request_headers: HashMap<String, String>,
-    pub request_body: Vec<u8>,
+    #[serde(default)]
+    pub request_body_size: usize,
+    #[serde(default)]
+    pub request_body_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "request_body")]
+    pub request_body_full: Option<Vec<u8>>,
     pub response_status: u16,
     pub response_headers: HashMap<String, String>,
     /// Size of the response body in bytes (always recorded)
@@ -76,11 +81,20 @@ fn headermap_to_hashmap(headers: &http::HeaderMap) -> HashMap<String, String> {
 impl RecordedRequest {
     /// Build a [`RecordedRequest`] from an [`HttpRequest`] / [`HttpResponse`] pair.
     pub fn from_parts(req: &HttpRequest, resp: &HttpResponse, record_full_body: bool) -> Self {
-        let body_bytes = &resp.body;
-        let body_size = body_bytes.len();
-        let body_hash = body_fingerprint(body_bytes);
-        let body_full = if record_full_body {
-            Some(body_bytes.to_vec())
+        // Response body: hash + size (always), full only if requested
+        let resp_body_bytes = &resp.body;
+        let resp_body_size = resp_body_bytes.len();
+        let resp_body_hash = body_fingerprint(resp_body_bytes);
+        let resp_body_full = if record_full_body {
+            Some(resp_body_bytes.to_vec())
+        } else {
+            None
+        };
+        // Request body: hash from reference (no clone), full only if requested
+        let req_body_size = req.body.len();
+        let req_body_hash = body_fingerprint(&req.body);
+        let req_body_full = if record_full_body {
+            Some(req.body.clone())
         } else {
             None
         };
@@ -88,12 +102,59 @@ impl RecordedRequest {
             method: req.method.as_str().to_string(),
             url: req.url.clone(),
             request_headers: req.headers.clone(),
-            request_body: req.body.clone(),
+            request_body_size: req_body_size,
+            request_body_hash: req_body_hash,
+            request_body_full: req_body_full,
             response_status: resp.status.as_u16(),
             response_headers: headermap_to_hashmap(&resp.headers),
-            response_body_size: body_size,
-            response_body_hash: body_hash,
-            response_body_full: body_full,
+            response_body_size: resp_body_size,
+            response_body_hash: resp_body_hash,
+            response_body_full: resp_body_full,
+            timestamp: now_millis(),
+        }
+    }
+
+    /// Pre-extract request data from a reference without cloning the body.
+    /// Returns (method, url, headers, body_size, body_hash) — all cheap to clone.
+    pub fn extract_request_meta(req: &HttpRequest) -> (String, String, HashMap<String, String>, usize, String) {
+        (
+            req.method.as_str().to_string(),
+            req.url.clone(),
+            req.headers.clone(),
+            req.body.len(),
+            body_fingerprint(&req.body),
+        )
+    }
+
+    /// Build from pre-extracted request metadata + response.
+    /// Avoids cloning the request body (hash + size only).
+    pub fn from_precomputed(
+        method: String,
+        url: String,
+        headers: HashMap<String, String>,
+        body_size: usize,
+        body_hash: String,
+        resp: &HttpResponse,
+        record_full_body: bool,
+    ) -> Self {
+        let resp_body_bytes = &resp.body;
+        let resp_body_full = if record_full_body {
+            Some(resp_body_bytes.to_vec())
+        } else {
+            None
+        };
+        Self {
+            method,
+            url,
+            request_headers: headers,
+            request_body_size: body_size,
+            request_body_hash: body_hash,
+            request_body_full: None, // request body never stored in compact mode
+            response_status: resp.status.as_u16(),
+            response_headers: headermap_to_hashmap(&resp.headers),
+            response_body_size: resp_body_bytes.len(),
+            response_body_hash: body_fingerprint(resp_body_bytes),
+            response_body_full: resp_body_full,
             timestamp: now_millis(),
         }
     }
@@ -114,8 +175,10 @@ impl RecordedRequest {
         for (k, v) in &self.request_headers {
             req = req.header(k.clone(), v.clone());
         }
-        if !self.request_body.is_empty() {
-            req = req.body(self.request_body.clone());
+        if let Some(ref body) = self.request_body_full {
+            if !body.is_empty() {
+                req = req.body(body.clone());
+            }
         }
         Ok(req)
     }
@@ -125,7 +188,7 @@ impl RecordedRequest {
         let mut parts: Vec<String> = vec!["curl".to_string()];
 
         // Method (omit for default GET without body)
-        if self.method != "GET" || !self.request_body.is_empty() {
+        if self.method != "GET" || self.request_body_size > 0 {
             parts.push(format!("-X {}", self.method));
         }
 
@@ -140,15 +203,15 @@ impl RecordedRequest {
         }
 
         // Body
-        if !self.request_body.is_empty() {
-            if let Ok(body_str) = std::str::from_utf8(&self.request_body) {
-                parts.push(format!("--data '{}'", body_str.replace('\'', "'\\''")));
+        if self.request_body_size > 0 {
+            if let Some(ref body) = self.request_body_full {
+                if let Ok(body_str) = std::str::from_utf8(body) {
+                    parts.push(format!("--data '{}'", body_str.replace('\'', "'\\''")));
+                } else {
+                    parts.push(format!("--data-binary '<{} bytes binary>'", body.len()));
+                }
             } else {
-                // Binary body – use base64 (informational)
-                parts.push(format!(
-                    "--data-binary '<{} bytes binary>'",
-                    self.request_body.len()
-                ));
+                parts.push(format!("<{} bytes, hash: {}>", self.request_body_size, self.request_body_hash));
             }
         }
 
@@ -187,9 +250,19 @@ impl RequestLog {
         self
     }
 
+    /// Get whether full body recording is enabled.
+    pub fn record_full_body(&self) -> bool {
+        self.record_full_body
+    }
+
     /// Record an HTTP request / response pair.
     pub fn record(&mut self, req: &HttpRequest, resp: &HttpResponse) {
         self.entries.push(RecordedRequest::from_parts(req, resp, self.record_full_body));
+    }
+
+    /// Record a pre-built entry directly.
+    pub fn record_entry(&mut self, entry: RecordedRequest) {
+        self.entries.push(entry);
     }
 
     /// Serialise the entire log to a JSON string.
