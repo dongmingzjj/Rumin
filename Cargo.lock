@@ -977,6 +977,7 @@ dependencies = [
  "clap",
  "mb-core",
  "mb-dom",
+ "mb-network",
  "tokio",
  "tracing",
  "tracing-subscriber",

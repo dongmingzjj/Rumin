@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use mb_network::client::{ClientConfig, HttpClient};
 use mb_network::cookie::CookieJar;
+use mb_network::interceptor::RequestLog;
 
 use crate::page::Page;
 
@@ -32,6 +33,19 @@ impl Browser {
     pub fn with_config(config: ClientConfig) -> Result<Self> {
         let cookies = Arc::new(Mutex::new(CookieJar::new()));
         let client = HttpClient::with_config(config)?.with_cookies(Arc::clone(&cookies));
+
+        Ok(Self {
+            client: Arc::new(client),
+            cookies,
+        })
+    }
+
+    /// Create a browser with a shared request log for recording HTTP traffic
+    pub fn with_request_log(log: Arc<Mutex<RequestLog>>) -> Result<Self> {
+        let cookies = Arc::new(Mutex::new(CookieJar::new()));
+        let client = HttpClient::new()?
+            .with_cookies(Arc::clone(&cookies))
+            .with_logging(log);
 
         Ok(Self {
             client: Arc::new(client),

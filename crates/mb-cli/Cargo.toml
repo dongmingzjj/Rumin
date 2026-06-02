@@ -15,3 +15,4 @@ tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 mb-core = { path = "../mb-core" }
 mb-dom = { path = "../mb-dom" }
+mb-network = { path = "../mb-network" }

@@ -1,5 +1,9 @@
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+use mb_network::interceptor::RequestLog;
 
 /// minibrowser — a minimal browser engine for web scraping
 #[derive(Parser)]
@@ -37,9 +41,23 @@ enum Commands {
         #[arg(long)]
         dom: bool,
 
+        /// Record all HTTP requests to a JSON file
+        #[arg(long)]
+        record: Option<String>,
+
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+    },
+
+    /// Replay previously recorded HTTP requests
+    Replay {
+        /// Path to the recorded JSON file
+        file: String,
+
+        /// Export requests as curl commands instead of replaying
+        #[arg(long)]
+        curl: bool,
     },
 }
 
@@ -55,6 +73,7 @@ async fn main() -> Result<()> {
             title,
             source,
             dom,
+            record,
             verbose,
         } => {
             // Set up logging
@@ -66,8 +85,19 @@ async fn main() -> Result<()> {
                 )
                 .init();
 
-            // Create browser and navigate
-            let browser = mb_core::Browser::new()?;
+            // Create browser (with optional request logging)
+            let log: Option<Arc<Mutex<RequestLog>>> = if record.is_some() {
+                Some(Arc::new(Mutex::new(RequestLog::new())))
+            } else {
+                None
+            };
+
+            let browser = if let Some(ref l) = log {
+                mb_core::Browser::with_request_log(Arc::clone(l))?
+            } else {
+                mb_core::Browser::new()?
+            };
+
             let mut page = browser.navigate(&url).await?;
 
             // Output based on flags
@@ -100,6 +130,52 @@ async fn main() -> Result<()> {
 
             if dom {
                 print_dom_tree(page.dom(), page.dom().document_node, 0);
+            }
+
+            // Save recorded requests if --record was specified
+            if let (Some(path), Some(ref log)) = (&record, &log) {
+                let log = log.lock().unwrap();
+                log.save(path)?;
+                eprintln!("Recorded {} request(s) to {}", log.entries().len(), path);
+            }
+        }
+
+        Commands::Replay { file, curl } => {
+            let log = RequestLog::load(&file)?;
+            let entries = log.entries();
+
+            if entries.is_empty() {
+                println!("No recorded requests in {}", file);
+                return Ok(());
+            }
+
+            if curl {
+                // Export as curl commands
+                for cmd in log.to_curl_commands() {
+                    println!("{}", cmd);
+                    println!();
+                }
+            } else {
+                // Replay requests via HTTP client
+                let client = mb_network::HttpClient::new()?;
+                for (i, entry) in entries.iter().enumerate() {
+                    let req = entry.to_http_request()?;
+                    println!(
+                        "[{}/{}] {} {}",
+                        i + 1,
+                        entries.len(),
+                        entry.method,
+                        entry.url
+                    );
+                    match client.execute(req).await {
+                        Ok(resp) => {
+                            println!("  -> {} ({} bytes)", resp.status, resp.body.len());
+                        }
+                        Err(e) => {
+                            eprintln!("  -> ERROR: {}", e);
+                        }
+                    }
+                }
             }
         }
     }

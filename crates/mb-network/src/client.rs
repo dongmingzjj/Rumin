@@ -14,6 +14,7 @@ use anyhow::Result;
 use wreq_util::Emulation;
 
 use crate::cookie::CookieJar;
+use crate::interceptor::RequestLog;
 use crate::request::HttpRequest;
 use crate::response::HttpResponse;
 use crate::tls::TlsConfig;
@@ -153,6 +154,7 @@ pub struct HttpClient {
     client: wreq::Client,
     config: ClientConfig,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    log: Option<Arc<Mutex<RequestLog>>>,
 }
 
 impl HttpClient {
@@ -187,12 +189,19 @@ impl HttpClient {
             client,
             config,
             cookie_jar: None,
+            log: None,
         })
     }
 
     /// Attach a shared cookie jar to this client
     pub fn with_cookies(mut self, jar: Arc<Mutex<CookieJar>>) -> Self {
         self.cookie_jar = Some(jar);
+        self
+    }
+
+    /// Attach a shared request log to this client
+    pub fn with_logging(mut self, log: Arc<Mutex<RequestLog>>) -> Self {
+        self.log = Some(log);
         self
     }
 
@@ -218,6 +227,13 @@ impl HttpClient {
 
     /// Execute a full HttpRequest
     pub async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+        // Clone request data for logging before body is consumed
+        let request_for_log = if self.log.is_some() {
+            Some(request.clone())
+        } else {
+            None
+        };
+
         let url: url::Url = request.url.parse()?;
 
         // Build the wreq request (uses From<Method> impl in request.rs)
@@ -266,12 +282,21 @@ impl HttpClient {
             }
         }
 
-        Ok(HttpResponse {
+        let response = HttpResponse {
             status,
             headers,
             body: body_bytes,
-            url: request.url,
-        })
+            url: request.url.clone(),
+        };
+
+        // Record to request log if enabled
+        if let (Some(ref log_mutex), Some(ref logged_req)) = (&self.log, &request_for_log) {
+            if let Ok(mut log) = log_mutex.lock() {
+                log.record(logged_req, &response);
+            }
+        }
+
+        Ok(response)
     }
 
     /// Get the client configuration
