@@ -47,6 +47,12 @@ pub struct RecordedRequest {
     pub timestamp: u64,
 }
 
+/// Wrap a string in single quotes for safe shell use.
+/// Internal single quotes are escaped using the standard `'\''` idiom.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -199,14 +205,14 @@ impl RecordedRequest {
             if lk == "host" || lk == "content-length" || lk == "transfer-encoding" {
                 continue;
             }
-            parts.push(format!("-H '{}: {}'", k, v));
+            parts.push(format!("-H {}", shell_single_quote(&format!("{}: {}", k, v))));
         }
 
         // Body
         if self.request_body_size > 0 {
             if let Some(ref body) = self.request_body_full {
                 if let Ok(body_str) = std::str::from_utf8(body) {
-                    parts.push(format!("--data '{}'", body_str.replace('\'', "'\\''")));
+                    parts.push(format!("--data {}", shell_single_quote(body_str)));
                 } else {
                     parts.push(format!("--data-binary '<{} bytes binary>'", body.len()));
                 }
@@ -216,7 +222,7 @@ impl RecordedRequest {
         }
 
         // URL (always last, quoted)
-        parts.push(format!("'{}'", self.url));
+        parts.push(shell_single_quote(&self.url));
 
         parts.join(" \\\n  ")
     }
@@ -413,6 +419,43 @@ mod tests {
         assert_eq!(entry.response_body_size, 14);
         assert!(entry.response_body_full.is_some());
         assert_eq!(entry.response_body_full.as_ref().unwrap(), b"<h1>Hello</h1>");
+    }
+
+    #[test]
+    fn curl_url_with_single_quote() {
+        let req = HttpRequest::get("https://example.com/it's").header("accept", "text/html");
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("content-type", "text/html".parse().unwrap());
+        let resp = HttpResponse {
+            status: StatusCode::OK,
+            headers: resp_headers,
+            body: Bytes::from_static(b"ok"),
+            url: "https://example.com/it's".to_string(),
+        };
+        let mut log = RequestLog::new();
+        log.record(&req, &resp);
+        let cmd = &log.to_curl_commands()[0];
+        // The single quote in the URL should be properly escaped
+        assert!(cmd.contains("https://example.com/it'\\''s"), "got: {cmd}");
+    }
+
+    #[test]
+    fn curl_header_value_with_single_quote() {
+        let req = HttpRequest::get("https://example.com/")
+            .header("x-custom", "it's a test");
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("content-type", "text/html".parse().unwrap());
+        let resp = HttpResponse {
+            status: StatusCode::OK,
+            headers: resp_headers,
+            body: Bytes::from_static(b"ok"),
+            url: "https://example.com/".to_string(),
+        };
+        let mut log = RequestLog::new();
+        log.record(&req, &resp);
+        let cmd = &log.to_curl_commands()[0];
+        // The single quote in the header should be properly escaped
+        assert!(cmd.contains("it'\\''s a test"), "got: {cmd}");
     }
 
     #[test]

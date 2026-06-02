@@ -217,7 +217,17 @@ fn print_dom_tree(dom: &mb_dom::tree::DomTree, node: mb_dom::node::NodeId, depth
             let text = data.data.trim();
             if !text.is_empty() {
                 let preview = if text.len() > 80 {
-                    format!("{}...", &text[..80])
+                    let end = text.char_indices()
+                        .map(|(i, _)| i)
+                        .filter(|&i| i <= 80)
+                        .last()
+                        .unwrap_or(0);
+                    if end == 0 {
+                        let s: String = text.chars().take(20).collect();
+                        format!("{}...", s)
+                    } else {
+                        format!("{}...", &text[..end])
+                    }
                 } else {
                     text.to_string()
                 };
