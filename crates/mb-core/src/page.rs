@@ -75,6 +75,7 @@ impl Page {
         // Apply emulation preset's user-agent and platform to navigator
         let preset = self.client.config().emulation;
         self.js.setup_navigator_with_overrides(preset.user_agent(), preset.platform())?;
+        self.js.setup_anti_detect()?;
 
         self.js.setup_location(url)?;
 

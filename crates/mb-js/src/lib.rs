@@ -25,6 +25,11 @@ pub mod web_apis;
 pub mod timers;
 pub mod cookies;
 pub mod xhr;
+pub mod event;
+pub mod animation;
+pub mod mutation_observer;
+pub mod intersection_observer;
+pub mod anti_detect;
 
 pub use dom_bridge::{Mutation, MutationKind};
 pub use timers::PendingCallback;
@@ -200,11 +205,16 @@ impl JsEngine {
         self.setup_timers()?;
         self.setup_console()?;
         self.setup_navigator()?;
+        self.setup_anti_detect()?;
         self.setup_location("about:blank")?;
         self.setup_screen()?;
         self.setup_chrome()?;
         self.setup_performance()?;
         self.setup_misc()?;
+        self.setup_events()?;
+        self.setup_animation_frames()?;
+        self.setup_intersection_observer()?;
+        self.setup_mutation_observer()?;
         Ok(())
     }
 
@@ -341,8 +351,14 @@ impl JsEngine {
     fn drain_and_execute_timers_one_round(&mut self) -> Result<u32> {
         let code = r#"
         (function() {
-            if (typeof __executeAllTimerCallbacks__ === 'undefined') return 0;
-            return __executeAllTimerCallbacks__();
+            var count = 0;
+            if (typeof __executeAllTimerCallbacks__ !== 'undefined') {
+                count = __executeAllTimerCallbacks__();
+            }
+            if (typeof __executeAllRAFCallbacks__ !== 'undefined') {
+                __executeAllRAFCallbacks__();
+            }
+            return count;
         })()
         "#;
 

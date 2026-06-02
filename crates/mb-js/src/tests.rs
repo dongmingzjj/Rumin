@@ -264,3 +264,67 @@ fn test_dom_firstchild_lastchild() {
     let last = engine.eval("document.querySelector('body').lastChild.tagName").unwrap();
     assert_eq!(last, "P");
 }
+
+#[test]
+fn test_event_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    let result = engine.eval("new Event('click').type").unwrap();
+    assert_eq!(result, "click");
+}
+
+#[test]
+fn test_custom_event() {
+    let mut engine = JsEngine::new_with_defaults();
+    let result = engine.eval("new CustomEvent('x', {detail: 42}).detail").unwrap();
+    assert_eq!(result, "42");
+}
+
+#[test]
+fn test_window_events() {
+    let mut engine = JsEngine::new_with_defaults();
+    let result = engine.eval(r#"
+        (function() {
+            var fired = false;
+            window.addEventListener('test', function(e) { fired = true; });
+            window.dispatchEvent(new Event('test'));
+            return fired ? 'fired' : 'not fired';
+        })()
+    "#).unwrap();
+    assert_eq!(result, "fired");
+}
+
+#[test]
+fn test_request_animation_frame() {
+    let mut engine = JsEngine::new_with_defaults();
+    engine.eval("var rafCalled = false; requestAnimationFrame(function(t) { rafCalled = true; });").unwrap();
+    // Execute timers (which also executes RAF callbacks)
+    engine.drain_and_execute_timers().unwrap();
+    let result = engine.eval("rafCalled").unwrap();
+    assert_eq!(result, "true");
+}
+
+#[test]
+fn test_cancel_animation_frame() {
+    let mut engine = JsEngine::new_with_defaults();
+    engine.eval("var rafCalled2 = false; var rafId = requestAnimationFrame(function(t) { rafCalled2 = true; }); cancelAnimationFrame(rafId);").unwrap();
+    engine.drain_and_execute_timers().unwrap();
+    let result = engine.eval("rafCalled2").unwrap();
+    assert_eq!(result, "false");
+}
+
+#[test]
+fn test_intersection_observer() {
+    let mut engine = JsEngine::new_with_defaults();
+    engine.eval("var ioResult = false; var obs = new IntersectionObserver(function(entries) { ioResult = entries[0].isIntersecting; }); obs.observe({});").unwrap();
+    // Execute timers to trigger the setTimeout(0) in observe
+    engine.drain_and_execute_timers().unwrap();
+    let result = engine.eval("ioResult").unwrap();
+    assert_eq!(result, "true");
+}
+
+#[test]
+fn test_webdriver() {
+    let mut engine = JsEngine::new_with_defaults();
+    let result = engine.eval("navigator.webdriver").unwrap();
+    assert_eq!(result, "false");
+}

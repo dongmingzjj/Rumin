@@ -143,8 +143,14 @@ impl JsEngine {
         for _round in 0..5u32 {
             let code = r#"
             (function() {
-                if (typeof __executeAllTimerCallbacks__ === 'undefined') return 0;
-                return __executeAllTimerCallbacks__();
+                var count = 0;
+                if (typeof __executeAllTimerCallbacks__ !== 'undefined') {
+                    count = __executeAllTimerCallbacks__();
+                }
+                if (typeof __executeAllRAFCallbacks__ !== 'undefined') {
+                    __executeAllRAFCallbacks__();
+                }
+                return count;
             })()
             "#;
 
