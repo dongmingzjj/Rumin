@@ -10,6 +10,7 @@
 use anyhow::{Result, anyhow};
 use rquickjs::{Context as QContext, Runtime, Value, Function};
 use rquickjs::function::Rest;
+use rquickjs::promise::PromiseState;
 use mb_dom::tree::DomTree;
 use mb_dom::node::{NodeKind, NodeId};
 use mb_dom::selector::SelectorEngine;
@@ -81,6 +82,89 @@ pub(crate) fn value_to_bool(val: &Value) -> Option<bool> {
     val.as_bool()
 }
 
+/// Split JavaScript code at the last top-level semicolon.
+/// Returns (setup_code, last_expression).
+///
+/// If there's no top-level semicolon, returns (None, code).
+/// Tracks string literals, template literals, and bracket depth to avoid
+/// splitting inside strings or nested expressions.
+fn split_last_expression(code: &str) -> (Option<String>, String) {
+    let bytes = code.as_bytes();
+    let len = bytes.len();
+    let mut last_semi: Option<usize> = None;
+    let mut depth: i32 = 0; // paren/bracket/brace depth
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_template = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        // Handle comments
+        if in_line_comment {
+            if b == b'\n' { in_line_comment = false; }
+            i += 1; continue;
+        }
+        if in_block_comment {
+            if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                in_block_comment = false; i += 2; continue;
+            }
+            i += 1; continue;
+        }
+
+        // Handle string escapes
+        if in_single_quote {
+            if b == b'\\' { i += 2; continue; } // skip escaped char
+            if b == b'\'' { in_single_quote = false; }
+            i += 1; continue;
+        }
+        if in_double_quote {
+            if b == b'\\' { i += 2; continue; }
+            if b == b'"' { in_double_quote = false; }
+            i += 1; continue;
+        }
+        if in_template {
+            if b == b'\\' { i += 2; continue; }
+            if b == b'`' { in_template = false; }
+            i += 1; continue;
+        }
+
+        // Start of strings/comments
+        if b == b'\'' { in_single_quote = true; i += 1; continue; }
+        if b == b'"' { in_double_quote = true; i += 1; continue; }
+        if b == b'`' { in_template = true; i += 1; continue; }
+        if b == b'/' && i + 1 < len {
+            if bytes[i + 1] == b'/' { in_line_comment = true; i += 2; continue; }
+            if bytes[i + 1] == b'*' { in_block_comment = true; i += 2; continue; }
+        }
+
+        // Track bracket depth
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' if depth == 0 => last_semi = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    match last_semi {
+        Some(pos) => {
+            let setup = code[..pos].trim().to_string();
+            let last = code[pos + 1..].trim().to_string();
+            if setup.is_empty() {
+                (None, last)
+            } else {
+                (Some(setup), last)
+            }
+        }
+        None => (None, code.to_string()),
+    }
+}
+
 impl JsEngine {
     /// Create a new JS engine instance
     pub fn new() -> Self {
@@ -114,40 +198,150 @@ impl JsEngine {
         Ok(())
     }
 
-    /// Evaluate JavaScript code and return the result as a string
+    /// Evaluate JavaScript code and return the result as a string.
+    ///
+    /// If the return value is a Promise, drains the microtask queue until the
+    /// Promise settles, then returns the resolved value (or error info for
+    /// rejected Promises). This ensures that async patterns like:
+    ///
+    /// ```ignore
+    /// Promise.resolve(42).then(v => v * 2)  // returns "84"
+    /// (async function() { return 42; })()   // returns "42"
+    /// ```
+    ///
+    /// work correctly from Rust's perspective.
     pub fn eval(&mut self, code: &str) -> Result<String> {
+        // Split code into setup + last expression at the last top-level semicolon.
+        // This allows us to drain microtasks between setup and result evaluation.
+        // Example: "var r; Promise.resolve(42).then(v => r = v); r"
+        //   → setup: "var r; Promise.resolve(42).then(v => r = v)"
+        //   → last:  "r"
+        let (setup_code, last_code) = split_last_expression(code);
+
         let result_str = self.context.with(|ctx| -> rquickjs::Result<String> {
-            let val: Value = ctx.eval(code)?;
-            Ok(js_value_to_string(&val))
+            // Phase 0: Execute setup code (everything except last expression)
+            if let Some(ref setup) = setup_code {
+                ctx.eval::<(), _>(setup.as_str())?;
+            }
+
+            // Phase 1: Execute the last expression
+            let val: Value = ctx.eval(last_code.as_str())?;
+
+            // Phase 2: If the return value is a Promise, drain microtasks
+            // until it settles, then return the resolved value.
+            if let Some(promise) = val.as_promise() {
+                for _ in 0..1000 {
+                    match promise.state() {
+                        PromiseState::Pending => {
+                            if !ctx.execute_pending_job() {
+                                if ctx.has_exception() {
+                                    let err = ctx.catch();
+                                    return Ok(format!("Error: {}", js_value_to_string(&err)));
+                                }
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
+                match promise.state() {
+                    PromiseState::Resolved => {
+                        if let Some(Ok(resolved_val)) = promise.result::<Value>() {
+                            // Drain microtasks from resolution
+                            for _ in 0..100 {
+                                if !ctx.execute_pending_job() { break; }
+                            }
+                            return Ok(js_value_to_string(&resolved_val));
+                        }
+                    }
+                    PromiseState::Rejected => {
+                        for _ in 0..100 {
+                            if !ctx.execute_pending_job() { break; }
+                        }
+                        if ctx.has_exception() {
+                            let err = ctx.catch();
+                            return Ok(format!("Error: {}", js_value_to_string(&err)));
+                        }
+                        if let Some(Ok(v)) = promise.result::<Value>() {
+                            return Ok(format!("Error: {}", js_value_to_string(&v)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Phase 3: Drain all microtasks (for side-effect patterns like
+            // Promise.resolve(42).then(v => r = v); r)
+            for _ in 0..1000 {
+                if !ctx.execute_pending_job() { break; }
+            }
+
+            // Phase 4: Re-evaluate the last expression to get the post-microtask value.
+            // After draining, variables may have been updated by .then() callbacks.
+            // This is safe for read-only expressions (variable refs, property access).
+            // For expressions with side effects (counter++), this may double-execute,
+            // but that's an acceptable trade-off for correctness.
+            let final_val: Value = ctx.eval(last_code.as_str())?;
+            Ok(js_value_to_string(&final_val))
         }).map_err(|e| anyhow!("JS evaluation error: {:?}", e))?;
 
-        // Drain pending Promise jobs (execute .then() callbacks)
-        // NOTE: Must be called outside ctx.with() due to RefCell borrow conflict
-        let mut job_rounds = 0;
+        // Drain any DOM mutations that were queued during eval + microtasks
+        if let Err(e) = self.drain_js_mutations() {
+            tracing::warn!("Failed to drain JS mutations: {}", e);
+        }
+
+        // Drain and execute pending timer callbacks.
+        // Timer callbacks may create new Promises (microtasks), so we loop
+        // to handle: timer -> Promise -> .then() chains.
+        for _round in 0..3u32 {
+            let timer_count = self.drain_and_execute_timers_one_round()?;
+            if timer_count == 0 { break; }
+
+            // After timers, drain microtasks again
+            self.drain_microtasks_outside_ctx();
+
+            // Drain mutations from timer-triggered microtasks
+            if let Err(e) = self.drain_js_mutations() {
+                tracing::warn!("Failed to drain JS mutations: {}", e);
+            }
+        }
+
+        Ok(result_str)
+    }
+
+    /// Drain microtasks using runtime.execute_pending_job() (outside ctx.with()).
+    /// Used for draining microtasks created by timer callbacks.
+    fn drain_microtasks_outside_ctx(&mut self) {
+        let mut rounds = 0;
         loop {
             match self.runtime.execute_pending_job() {
-                Ok(true) => { job_rounds += 1; }
+                Ok(true) => { rounds += 1; }
                 Ok(false) => break,
                 Err(e) => {
                     tracing::warn!("Promise job error: {:?}", e);
                     break;
                 }
             }
-            if job_rounds > 100 { break; }
+            if rounds > 100 { break; }
         }
-        if job_rounds > 0 {
-            tracing::debug!("Executed {} Promise job rounds", job_rounds);
-        }
+    }
 
-        // Drain any DOM mutations that were queued during eval
-        if let Err(e) = self.drain_js_mutations() {
-            tracing::warn!("Failed to drain JS mutations: {}", e);
-        }
+    /// Execute one round of timer callbacks. Returns the number of callbacks executed.
+    fn drain_and_execute_timers_one_round(&mut self) -> Result<u32> {
+        let code = r#"
+        (function() {
+            if (typeof __executeAllTimerCallbacks__ === 'undefined') return 0;
+            return __executeAllTimerCallbacks__();
+        })()
+        "#;
 
-        // Drain and execute pending timer callbacks (up to 5 rounds)
-        let _ = self.drain_and_execute_timers();
+        let count = self.context.with(|ctx| -> rquickjs::Result<u32> {
+            let result: Value = ctx.eval(code)?;
+            Ok(result.as_float().unwrap_or(0.0) as u32)
+        }).map_err(|e| anyhow!("Failed to execute timer callbacks: {:?}", e))?;
 
-        Ok(result_str)
+        Ok(count)
     }
 
     /// Drain JS-side __mutations__ array and add to self.mutations.

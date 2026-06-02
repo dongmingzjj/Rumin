@@ -139,6 +139,8 @@ impl JsEngine {
     }
 
     /// Drain and execute pending timer callbacks, up to 5 rounds.
+    /// Also drains microtasks after each round to handle timer callbacks
+    /// that create Promises (e.g. setTimeout(() => { fetch(...).then(...) }, 0)).
     pub fn drain_and_execute_timers(&mut self) -> Result<()> {
         for _round in 0..5u32 {
             let code = r#"
@@ -150,6 +152,11 @@ impl JsEngine {
 
             let count = self.context.with(|ctx| -> rquickjs::Result<u32> {
                 let result: Value = ctx.eval(code)?;
+                // Drain microtasks inside ctx.with() — timer callbacks may create
+                // Promises whose .then() callbacks need to run
+                for _ in 0..50 {
+                    if !ctx.execute_pending_job() { break; }
+                }
                 Ok(result.as_float().unwrap_or(0.0) as u32)
             }).map_err(|e| anyhow!("Failed to execute timer callbacks: {:?}", e))?;
 

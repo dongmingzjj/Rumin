@@ -429,7 +429,8 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
         globalThis.fetch = function(url, options) {
             var method = (options && options.method) || 'GET';
             var body = (options && options.body) || '';
-            var result = _native_fetch(method, url, body);
+            var raw = _native_fetch(method, url, body);
+            var result = JSON.parse(raw);
             return new Promise(function(resolve, reject) {
                 if (result.ok) {
                     resolve({
