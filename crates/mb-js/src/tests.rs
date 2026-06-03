@@ -573,3 +573,62 @@ fn test_text_decoder() {
     let result = engine.eval("new TextDecoder().decode(new Uint8Array([104,101,108,108,111]))").unwrap();
     assert_eq!(result, "hello", "TextDecoder.decode should return 'hello'");
 }
+
+#[test]
+fn test_url_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("new URL('https://example.com/path?q=1').pathname").unwrap(), "/path");
+    assert_eq!(engine.eval("new URL('https://example.com/path?q=1').hostname").unwrap(), "example.com");
+    assert_eq!(engine.eval("new URL('https://example.com/path?q=1').search").unwrap(), "?q=1");
+    assert_eq!(engine.eval("new URL('https://example.com/path?q=1').protocol").unwrap(), "https:");
+    assert_eq!(engine.eval("new URL('https://example.com/path?q=1').origin").unwrap(), "https://example.com");
+    assert_eq!(engine.eval("new URL('/page', 'https://example.com/base').href").unwrap(), "https://example.com/page");
+    assert_eq!(engine.eval("typeof URLSearchParams").unwrap(), "function");
+    assert_eq!(engine.eval("new URLSearchParams('a=1&b=2').get('a')").unwrap(), "1");
+}
+
+#[test]
+fn test_crypto_get_random_values() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof crypto").unwrap(), "object");
+    assert_eq!(engine.eval("typeof crypto.getRandomValues").unwrap(), "function");
+    let result = engine.eval(r#"
+        var arr = new Uint8Array(10);
+        crypto.getRandomValues(arr);
+        arr.length
+    "#).unwrap();
+    assert_eq!(result, "10");
+}
+
+#[test]
+fn test_dom_parser() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof DOMParser").unwrap(), "function");
+    let result = engine.eval(r#"
+        var parser = new DOMParser();
+        var doc = parser.parseFromString('<html><body><h1>Hello</h1></body></html>', 'text/html');
+        doc.documentElement ? doc.documentElement.tagName : 'null'
+    "#).unwrap();
+    assert_eq!(result, "HTML");
+}
+
+#[test]
+fn test_blob_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof Blob").unwrap(), "function");
+    assert_eq!(engine.eval("new Blob(['hello']).size").unwrap(), "5");
+    assert_eq!(engine.eval("new Blob(['hello'], {type:'text/plain'}).type").unwrap(), "text/plain");
+}
+
+#[test]
+fn test_formdata_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof FormData").unwrap(), "function");
+    let result = engine.eval(r#"
+        var fd = new FormData();
+        fd.append('name', 'Alice');
+        fd.append('name', 'Bob');
+        fd.get('name') + ',' + fd.getAll('name').length
+    "#).unwrap();
+    assert_eq!(result, "Alice,2");
+}

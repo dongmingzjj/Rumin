@@ -36,6 +36,10 @@ pub mod websocket;
 pub mod computed_style;
 pub mod canvas;
 pub mod text_encoding;
+pub mod url_api;
+pub mod crypto_api;
+pub mod dom_parser;
+pub mod blob_formdata;
 
 pub use dom_bridge::{Mutation, MutationKind};
 pub use timers::PendingCallback;
@@ -268,6 +272,10 @@ impl JsEngine {
         self.setup_canvas()?;
         self.setup_indexed_db()?;
         self.setup_text_encoding()?;
+        self.setup_url_api()?;
+        self.setup_crypto_api()?;
+        self.setup_dom_parser()?;
+        self.setup_blob_formdata()?;
         Ok(())
     }
 

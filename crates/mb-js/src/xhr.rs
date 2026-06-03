@@ -529,18 +529,30 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
             var result = JSON.parse(raw);
             return new Promise(function(resolve, reject) {
                 if (result.ok) {
-                    resolve({
+                    var _rawHeaders = result.headers || {};
+                    var response = {
                         ok: true,
                         status: result.status,
                         statusText: result.statusText,
                         url: url,
+                        redirected: false,
+                        type: 'basic',
+                        bodyUsed: false,
                         _body: result.body,
-                        _headers: result.headers,
-                        json: function() { return JSON.parse(this._body); },
-                        text: function() { return this._body; },
-                        blob: function() { return this._body; },
-                        arrayBuffer: function() { return this._body; },
+                        _headers: _rawHeaders,
+                        json: function() { this.bodyUsed = true; return JSON.parse(this._body); },
+                        text: function() { this.bodyUsed = true; return this._body; },
+                        blob: function() { this.bodyUsed = true; return this._body; },
+                        arrayBuffer: function() { this.bodyUsed = true; return this._body; },
+                        clone: function() {
+                            var cloned = Object.assign({}, this);
+                            cloned._body = this._body;
+                            cloned._headers = Object.assign({}, this._headers);
+                            cloned.bodyUsed = false;
+                            return cloned;
+                        },
                         headers: {
+                            _headers: _rawHeaders,
                             get: function(name) {
                                 var h = this._headers || {};
                                 return h[name.toLowerCase()] || null;
@@ -548,9 +560,38 @@ pub fn register_xhr(ctx: &rquickjs::Context, http_client: Arc<HttpClient>, runti
                             has: function(name) {
                                 var h = this._headers || {};
                                 return h.hasOwnProperty(name.toLowerCase());
+                            },
+                            entries: function() {
+                                var h = this._headers || {};
+                                var result = [];
+                                var keys = Object.keys(h);
+                                for (var i = 0; i < keys.length; i++) {
+                                    result.push([keys[i], h[keys[i]]]);
+                                }
+                                return result;
+                            },
+                            keys: function() {
+                                return Object.keys(this._headers || {});
+                            },
+                            values: function() {
+                                var h = this._headers || {};
+                                var result = [];
+                                var keys = Object.keys(h);
+                                for (var i = 0; i < keys.length; i++) {
+                                    result.push(h[keys[i]]);
+                                }
+                                return result;
+                            },
+                            forEach: function(fn) {
+                                var h = this._headers || {};
+                                var keys = Object.keys(h);
+                                for (var i = 0; i < keys.length; i++) {
+                                    fn(h[keys[i]], keys[i], this);
+                                }
                             }
                         }
-                    });
+                    };
+                    resolve(response);
                 } else {
                     reject(new Error('fetch failed: ' + result.statusText));
                 }

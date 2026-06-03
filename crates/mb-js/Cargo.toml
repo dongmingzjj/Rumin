@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 mb-dom = { path = "../mb-dom" }
+mb-html = { path = "../mb-html" }
 mb-network = { path = "../mb-network" }
 rquickjs = { version = "0.12", features = ["full"] }
 slotmap = "1.1"
