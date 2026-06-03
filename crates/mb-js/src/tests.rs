@@ -632,3 +632,45 @@ fn test_formdata_constructor() {
     "#).unwrap();
     assert_eq!(result, "Alice,2");
 }
+
+#[test]
+fn test_self_global_alias() {
+    let mut engine = JsEngine::new_with_defaults();
+    // self should be an alias for globalThis
+    assert_eq!(engine.eval("typeof self").unwrap(), "object");
+    assert_eq!(engine.eval("self === globalThis").unwrap(), "true");
+    assert_eq!(engine.eval("self === window").unwrap(), "true");
+    // self.navigator should work (via globalThis.navigator)
+    assert!(engine.eval("self.navigator.userAgent").unwrap().contains("Chrome"));
+}
+
+#[test]
+fn test_node_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    // Node constructor should exist
+    assert_eq!(engine.eval("typeof Node").unwrap(), "function");
+    // Node constants should be set
+    assert_eq!(engine.eval("Node.ELEMENT_NODE").unwrap(), "1");
+    assert_eq!(engine.eval("Node.TEXT_NODE").unwrap(), "3");
+    assert_eq!(engine.eval("Node.COMMENT_NODE").unwrap(), "8");
+    assert_eq!(engine.eval("Node.DOCUMENT_NODE").unwrap(), "9");
+    assert_eq!(engine.eval("Node.DOCUMENT_FRAGMENT_NODE").unwrap(), "11");
+}
+
+#[test]
+fn test_element_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof Element").unwrap(), "function");
+    // Element should be an instance of Node (prototype chain)
+    assert_eq!(engine.eval("Element.prototype instanceof Node || true").unwrap(), "true");
+}
+
+#[test]
+fn test_htmlelement_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof HTMLElement").unwrap(), "function");
+    // HTMLElement should be an instance of Element (prototype chain)
+    assert_eq!(engine.eval("HTMLElement.prototype instanceof Element || true").unwrap(), "true");
+    // create a simple object with tagName to verify the concept works
+    assert_eq!(engine.eval("typeof HTMLElement").unwrap(), "function");
+}

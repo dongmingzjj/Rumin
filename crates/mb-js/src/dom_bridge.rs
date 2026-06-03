@@ -370,6 +370,32 @@ impl JsEngine {
         // Set window alias
         code.push_str("globalThis.window = globalThis;\n");
 
+        // Minimal Node / Element / HTMLElement constructors for SPA frameworks
+        code.push_str(r#"
+        // --- Node constructor (constants only) ---
+        var Node = function() {};
+        Node.ELEMENT_NODE = 1;
+        Node.ATTRIBUTE_NODE = 2;
+        Node.TEXT_NODE = 3;
+        Node.CDATA_SECTION_NODE = 4;
+        Node.PROCESSING_INSTRUCTION_NODE = 7;
+        Node.COMMENT_NODE = 8;
+        Node.DOCUMENT_NODE = 9;
+        Node.DOCUMENT_TYPE_NODE = 10;
+        Node.DOCUMENT_FRAGMENT_NODE = 11;
+        globalThis.Node = Node;
+
+        // --- Element constructor ---
+        var Element = function() {};
+        Element.prototype = Object.create(Node.prototype);
+        globalThis.Element = Element;
+
+        // --- HTMLElement constructor ---
+        var HTMLElement = function() {};
+        HTMLElement.prototype = Object.create(Element.prototype);
+        globalThis.HTMLElement = HTMLElement;
+        "#);
+
         // Eval 1: document + window globals (must succeed)
         let doc_code = format!(
             r#"globalThis.window = globalThis;
