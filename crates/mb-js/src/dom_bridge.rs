@@ -761,6 +761,27 @@ globalThis.document = {{
 
         // Shared prototype for all DOM elements — add methods here once, all elements inherit them
         var __dom_element_proto__ = {
+            get parentNode() { return this._parentId ? (__dom_elements__[this._parentId] || null) : null; },
+            get parentElement() { var p = this.parentNode; return (p && p.tagName) ? p : null; },
+            get children() { var r = []; var ids = this._childNodesIds || []; for (var i = 0; i < ids.length; i++) { var e = __dom_elements__[ids[i]]; if (e && e.tagName) r.push(e); } return r; },
+            get childNodes() { var r = []; var ids = this._childNodesIds || []; for (var i = 0; i < ids.length; i++) { var e = __dom_elements__[ids[i]]; if (e) r.push(e); } return r; },
+            get firstChild() { if (!this._childNodesIds || this._childNodesIds.length === 0) return null; return __dom_elements__[this._childNodesIds[0]] || null; },
+            get lastChild() { if (!this._childNodesIds || this._childNodesIds.length === 0) return null; return __dom_elements__[this._childNodesIds[this._childNodesIds.length - 1]] || null; },
+            get nextSibling() { var p = this.parentNode; if (!p || !p._childNodesIds) return null; var idx = p._childNodesIds.indexOf(this._nodeId || this._createdId); if (idx < 0 || idx >= p._childNodesIds.length - 1) return null; return __dom_elements__[p._childNodesIds[idx + 1]] || null; },
+            get previousSibling() { var p = this.parentNode; if (!p || !p._childNodesIds) return null; var idx = p._childNodesIds.indexOf(this._nodeId || this._createdId); if (idx <= 0) return null; return __dom_elements__[p._childNodesIds[idx - 1]] || null; },
+            get textContent() { return this._textContent || ''; },
+            set textContent(v) { this._textContent = String(v); if (typeof __mut_set_text__ === 'function') __mut_set_text__(this._nodeId || this._createdId, String(v)); },
+            get innerHTML() { return this._innerHTML || ''; },
+            set innerHTML(v) { this._innerHTML = String(v); if (typeof __mut_set_inner_html__ === 'function') __mut_set_inner_html__(this._nodeId || this._createdId, String(v)); },
+            get outerHTML() {
+                if (!this.tagName) return this._textContent || '';
+                var tag = this.tagName.toLowerCase();
+                var attrs = '';
+                if (this._attrs) { for (var k in this._attrs) { if (this._attrs.hasOwnProperty(k)) attrs += ' ' + k + '="' + String(this._attrs[k]).replace(/"/g, '&quot;') + '"'; } }
+                var voidTags = {area:1,base:1,br:1,col:1,embed:1,hr:1,img:1,input:1,link:1,meta:1,param:1,source:1,track:1,wbr:1};
+                if (voidTags[tag]) return '<' + tag + attrs + '>';
+                return '<' + tag + attrs + '>' + (this._innerHTML || '') + '</' + tag + '>';
+            },
             appendChild: function(child) {
                 var childId = child._nodeId || child._createdId;
                 if (childId) {
@@ -868,11 +889,34 @@ globalThis.document = {{
                 }
             },
             dispatchEvent: function(event) {
-                if (this._listeners && this._listeners[event.type]) {
-                    var self = this;
-                    this._listeners[event.type].forEach(function(l) { l.call(self, event); });
+                // Set target to the element that dispatchEvent was called on
+                if (!event.target) event.target = this;
+                
+                // Build ancestor chain for bubbling
+                var chain = [this];
+                if (event.bubbles) {
+                    var p = this.parentNode;
+                    while (p) {
+                        chain.push(p);
+                        p = p.parentNode;
+                    }
                 }
-                return true;
+                
+                // Dispatch through the chain (target first, then ancestors)
+                for (var i = 0; i < chain.length; i++) {
+                    var el = chain[i];
+                    if (el._listeners && el._listeners[event.type]) {
+                        event.currentTarget = el;
+                        var listeners = el._listeners[event.type].slice(); // copy to avoid mutation
+                        for (var j = 0; j < listeners.length; j++) {
+                            if (event._immediatePropagationStopped) break;
+                            listeners[j].call(el, event);
+                        }
+                    }
+                    if (event._propagationStopped) break;
+                }
+                event.currentTarget = null;
+                return !event._defaultPrevented;
             },
             matches: function(selector) {
                 selector = selector.trim();
