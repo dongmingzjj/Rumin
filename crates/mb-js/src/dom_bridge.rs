@@ -740,6 +740,20 @@ globalThis.document = {{
             __mutations__.push({type: 'removeChild', parentId: parentId, childId: childId});
         }
 
+        // Helper: check if elementId is a descendant of rootId
+        function __is_descendant__(rootId, elementId) {
+            if (!rootId || !elementId) return false;
+            if (rootId === elementId) return true;
+            var el = __dom_elements__[elementId];
+            while (el) {
+                var pid = el._parentId;
+                if (!pid) return false;
+                if (pid === rootId) return true;
+                el = __dom_elements__[pid];
+            }
+            return false;
+        }
+
         // Shared prototype for all DOM elements — add methods here once, all elements inherit them
         var __dom_element_proto__ = {
             appendChild: function(child) {
@@ -994,7 +1008,12 @@ globalThis.document = {{
             querySelector: function(sel) {
                 if (typeof _dom_query_selector_all === 'function') {
                     var ids = _dom_query_selector_all(sel);
-                    if (ids && ids.length > 0) return __dom_elements__[ids[0]] || null;
+                    if (ids) {
+                        var rootId = this._nodeId || this._createdId;
+                        for (var i = 0; i < ids.length; i++) {
+                            if (__is_descendant__(rootId, ids[i])) return __dom_elements__[ids[i]] || null;
+                        }
+                    }
                 }
                 return null;
             },
@@ -1003,9 +1022,10 @@ globalThis.document = {{
                     var ids = _dom_query_selector_all(sel);
                     var result = [];
                     if (ids) {
+                        var rootId = this._nodeId || this._createdId;
                         for (var i = 0; i < ids.length; i++) {
                             var el = __dom_elements__[ids[i]];
-                            if (el) result.push(el);
+                            if (el && __is_descendant__(rootId, ids[i])) result.push(el);
                         }
                     }
                     return result;
