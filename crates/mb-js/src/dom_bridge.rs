@@ -394,6 +394,11 @@ impl JsEngine {
         var HTMLElement = function() {};
         HTMLElement.prototype = Object.create(Element.prototype);
         globalThis.HTMLElement = HTMLElement;
+
+        // Fix __dom_element_proto__ chain: inherit from HTMLElement.prototype for instanceof
+        if (typeof __dom_element_proto__ !== 'undefined') {
+            Object.setPrototypeOf(__dom_element_proto__, HTMLElement.prototype);
+        }
         "#);
 
         // Eval 1: document + window globals (must succeed)
