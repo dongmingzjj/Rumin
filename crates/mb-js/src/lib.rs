@@ -35,6 +35,7 @@ pub mod indexed_db;
 pub mod websocket;
 pub mod computed_style;
 pub mod canvas;
+pub mod text_encoding;
 
 pub use dom_bridge::{Mutation, MutationKind};
 pub use timers::PendingCallback;
@@ -266,6 +267,7 @@ impl JsEngine {
         self.setup_computed_style()?;
         self.setup_canvas()?;
         self.setup_indexed_db()?;
+        self.setup_text_encoding()?;
         Ok(())
     }
 
@@ -309,6 +311,16 @@ impl JsEngine {
                     return Err(rquickjs::Error::Exception);
                 }
             };
+
+            // Phase 1.5: Drain all pending microtasks (multiple rounds)
+            for _ in 0..100 {
+                if !ctx.execute_pending_job() {
+                    break;
+                }
+            }
+            if ctx.has_exception() {
+                ctx.catch(); // swallow microtask errors
+            }
 
             // Phase 2: If the return value is a Promise, drain microtasks
             // until it settles, then return the resolved value.
@@ -535,6 +547,14 @@ impl JsEngine {
             Ok(())
         }).map_err(|e| anyhow!("Failed to drain mutations: {:?}", e))?;
         Ok(())
+    }
+
+    /// Drain and return all pending dynamic script URLs.
+    /// These are URLs from dynamically inserted <script> elements (via appendChild/insertBefore).
+    pub fn drain_dynamic_scripts(&mut self) -> Vec<String> {
+        dom_bridge::DYNAMIC_SCRIPTS.with(|scripts| {
+            std::mem::take(&mut *scripts.borrow_mut())
+        })
     }
 
     /// Drain and return all pending mutations.

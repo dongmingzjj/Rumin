@@ -526,3 +526,50 @@ fn test_websocket_constructor() {
     "#).unwrap();
     assert_eq!(result, "ok");
 }
+
+#[test]
+fn test_microtask_drain() {
+    let mut engine = JsEngine::new_with_defaults();
+    let result = engine.eval("Promise.resolve(42).then(function(v) { return v; })").unwrap();
+    assert_eq!(result, "42", "Promise.resolve(42).then should return 42");
+}
+
+#[test]
+fn test_document_document_element() {
+    use mb_dom::tree::DomTree;
+
+    let dom = DomTree::new();
+    let mut engine = JsEngine::new_with_defaults();
+    engine.bind_dom(&dom).unwrap();
+
+    // document.documentElement should exist
+    let result = engine.eval("typeof document.documentElement").unwrap();
+    assert_eq!(result, "object", "document.documentElement should be an object");
+
+    // document.documentElement should have tagName 'HTML'
+    let tag = engine.eval("document.documentElement.tagName").unwrap();
+    assert_eq!(tag, "HTML", "document.documentElement.tagName should be HTML");
+}
+
+#[test]
+fn test_text_encoder() {
+    let mut engine = JsEngine::new_with_defaults();
+    // TextEncoder should exist
+    assert_eq!(engine.eval("typeof TextEncoder").unwrap(), "function");
+    // encode('hello') should return a Uint8Array-like result
+    let result = engine.eval("new TextEncoder().encode('hello').length").unwrap();
+    assert_eq!(result, "5", "TextEncoder.encode('hello').length should be 5");
+    // First byte should be 104 ('h')
+    let first = engine.eval("new TextEncoder().encode('hello')[0]").unwrap();
+    assert_eq!(first, "104", "First byte of encode('hello') should be 104");
+}
+
+#[test]
+fn test_text_decoder() {
+    let mut engine = JsEngine::new_with_defaults();
+    // TextDecoder should exist
+    assert_eq!(engine.eval("typeof TextDecoder").unwrap(), "function");
+    // decode(Uint8Array([104,101,108,108,111])) should return 'hello'
+    let result = engine.eval("new TextDecoder().decode(new Uint8Array([104,101,108,108,111]))").unwrap();
+    assert_eq!(result, "hello", "TextDecoder.decode should return 'hello'");
+}

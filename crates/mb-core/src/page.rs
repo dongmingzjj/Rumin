@@ -10,6 +10,32 @@ use mb_js::{JsEngine, Mutation, MutationKind};
 use mb_network::client::HttpClient;
 use mb_network::cookie::CookieJar;
 
+/// Resolve a script URL relative to a base URL.
+fn resolve_script_url(base: &str, relative: &str) -> String {
+    if relative.starts_with("http://") || relative.starts_with("https://") {
+        return relative.to_string();
+    }
+    if relative.starts_with("//") {
+        return format!("https:{}", relative);
+    }
+    if relative.starts_with('/') {
+        if let Ok(base_url) = url::Url::parse(base) {
+            return format!(
+                "{}://{}{}",
+                base_url.scheme(),
+                base_url.host_str().unwrap_or(""),
+                relative
+            );
+        }
+    }
+    if let Ok(base_url) = url::Url::parse(base) {
+        if let Ok(resolved) = base_url.join(relative) {
+            return resolved.to_string();
+        }
+    }
+    relative.to_string()
+}
+
 /// A single page/tab in the browser
 pub struct Page {
     /// Current URL
@@ -164,6 +190,9 @@ impl Page {
             tracing::debug!("load event dispatch: {}", e);
         }
 
+        // Execute any dynamically queued scripts (from event handlers, etc.)
+        self.execute_dynamic_scripts();
+
         Ok(())
     }
 
@@ -178,6 +207,9 @@ impl Page {
                 tracing::warn!("Failed to apply mutation: {}", e);
             }
         }
+
+        // Execute any dynamically queued scripts
+        self.execute_dynamic_scripts();
 
         Ok(result)
     }
@@ -312,6 +344,78 @@ impl Page {
     /// Get the raw HTML source
     pub fn source(&self) -> &str {
         &self.html
+    }
+
+    /// Execute dynamically queued scripts (from appendChild/insertBefore of <script> tags).
+    /// Downloads external scripts and executes inline scripts. Loops until no more are queued.
+    fn execute_dynamic_scripts(&mut self) {
+        const MAX_ROUNDS: usize = 10;
+        for _round in 0..MAX_ROUNDS {
+            let urls = self.js.drain_dynamic_scripts();
+            if urls.is_empty() {
+                break;
+            }
+            for raw_url in urls {
+                let script_url = resolve_script_url(&self.url, &raw_url);
+                tracing::debug!("Loading dynamic script from {}", script_url);
+
+                let client = Arc::clone(&self.client);
+                let url_clone = script_url.clone();
+                let result = tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    handle.block_on(async move { client.get(&url_clone).await })
+                });
+
+                match result {
+                    Ok(response) => {
+                        if response.is_success() {
+                            match response.text() {
+                                Ok(code) => {
+                                    tracing::debug!(
+                                        "Executing dynamic script ({} bytes) from {}",
+                                        code.len(),
+                                        script_url
+                                    );
+                                    if let Err(e) = self.js.eval(&code) {
+                                        tracing::warn!(
+                                            "Dynamic script error from {}: {}",
+                                            script_url,
+                                            e
+                                        );
+                                    }
+                                    // Apply mutations from dynamic script
+                                    let mutations = self.js.drain_mutations();
+                                    for m in mutations {
+                                        if let Err(e) = self.apply_mutation(m) {
+                                            tracing::warn!(
+                                                "Failed to apply mutation: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    "Failed to read dynamic script body from {}: {}",
+                                    script_url,
+                                    e
+                                ),
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Dynamic script fetch failed: HTTP {} for {}",
+                                response.status_code(),
+                                script_url
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "Dynamic script download error for {}: {}",
+                        script_url,
+                        e
+                    ),
+                }
+            }
+        }
     }
 
     /// Get the current URL

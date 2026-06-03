@@ -12,6 +12,11 @@ thread_local! {
     pub(crate) static DOM_ELEMENTS: RefCell<HashMap<u64, (String, Vec<String>, String, Option<u64>)>> = RefCell::new(HashMap::new());
 }
 
+// Thread-local queue for dynamically inserted script URLs (from appendChild/insertBefore)
+thread_local! {
+    pub(crate) static DYNAMIC_SCRIPTS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
 /// A mutation that was performed on the JS side and needs to be applied to the Rust DomTree.
 #[derive(Debug, Clone)]
 pub struct Mutation {
@@ -341,6 +346,7 @@ impl JsEngine {
         let title = Self::escape_js_string(&Self::find_title(dom));
         let head_id = dom.head_node.data().as_ffi();
         let body_id = dom.body_node.data().as_ffi();
+        let html_id = dom.html_node.data().as_ffi();
 
         // 5. Inject everything into JS
         let mut code = String::new();
@@ -352,6 +358,7 @@ impl JsEngine {
         code.push_str(&format!("var __dom_by_id__ = {};\n", id_index));
         code.push_str(&format!("var __dom_head_id__ = {};\n", head_id));
         code.push_str(&format!("var __dom_body_id__ = {};\n", body_id));
+        code.push_str(&format!("var __dom_html_id__ = {};\n", html_id));
         code.push_str(
             "var __dom_node_name__ = function(n) {\n\
              if (n === null || n === undefined) return null;\n\
@@ -374,6 +381,7 @@ globalThis.document = {{
     set title(v) {{ this._title = String(v); }},
     get head() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_head_id__) : null; }},
     get body() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_body_id__) : null; }},
+    get documentElement() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_html_id__) : null; }},
     get cookie() {{ return (typeof _get_cookies === 'function') ? _get_cookies() : ''; }},
     set cookie(v) {{ if (typeof _set_cookie === 'function') _set_cookie(v); }},
     getElementById: function(id) {{
@@ -619,6 +627,24 @@ globalThis.document = {{
             Ok(())
         }).map_err(|e| anyhow!("Failed to register querySelectorAll: {:?}", e))?;
 
+        // Register native __queue_dynamic_script__ function
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let queue_fn = Function::new(ctx.clone(), |args: Rest<Value>| -> rquickjs::Result<()> {
+                let url = args.get(0)
+                    .and_then(|v| v.as_string())
+                    .and_then(|s| s.to_string().ok())
+                    .unwrap_or_default();
+                if !url.is_empty() {
+                    DYNAMIC_SCRIPTS.with(|scripts| {
+                        scripts.borrow_mut().push(url);
+                    });
+                }
+                Ok(())
+            })?;
+            ctx.globals().set("__queue_dynamic_script__", queue_fn)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to register __queue_dynamic_script__: {:?}", e))?;
+
         if let Err(e) = self.context.with(|ctx| -> rquickjs::Result<()> {
             let _: Value = ctx.eval(doc_code.as_str())?;
             Ok(())
@@ -676,6 +702,20 @@ globalThis.document = {{
                 }
                 this._childNodesIds.push(childId || 0);
                 child._parentId = this._nodeId;
+                // Detect dynamic script insertion
+                if (child.tagName === 'SCRIPT') {
+                    var scriptSrc = child.src || (child._attrs && child._attrs.src) || '';
+                    if (scriptSrc) {
+                        if (typeof __queue_dynamic_script__ === 'function') {
+                            __queue_dynamic_script__(scriptSrc);
+                        }
+                    } else {
+                        var code = child.textContent || child._textContent || '';
+                        if (code) {
+                            try { eval(code); } catch(e) {}
+                        }
+                    }
+                }
                 return child;
             },
             insertBefore: function(newNode, refNode) {
@@ -690,6 +730,20 @@ globalThis.document = {{
                     this._childNodesIds.push(newId);
                 }
                 newNode._parentId = this._nodeId;
+                // Detect dynamic script insertion
+                if (newNode.tagName === 'SCRIPT') {
+                    var scriptSrc = newNode.src || (newNode._attrs && newNode._attrs.src) || '';
+                    if (scriptSrc) {
+                        if (typeof __queue_dynamic_script__ === 'function') {
+                            __queue_dynamic_script__(scriptSrc);
+                        }
+                    } else {
+                        var code = newNode.textContent || newNode._textContent || '';
+                        if (code) {
+                            try { eval(code); } catch(e) {}
+                        }
+                    }
+                }
                 return newNode;
             },
             removeChild: function(child) {
