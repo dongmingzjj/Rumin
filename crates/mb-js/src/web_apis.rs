@@ -508,4 +508,54 @@ impl JsEngine {
 
         (protocol, host, pathname, search, hash)
     }
+
+    /// P0 polyfills: queueMicrotask, structuredClone, replaceAll, Array.at
+    pub fn setup_p0_polyfills(&mut self) -> Result<()> {
+        let code = r#"
+        // queueMicrotask — used by Vue 3, React 18, fetch polyfills
+        if (typeof globalThis.queueMicrotask === 'undefined') {
+            globalThis.queueMicrotask = function(callback) {
+                Promise.resolve().then(callback);
+            };
+        }
+
+        // structuredClone — used by modern state management
+        if (typeof globalThis.structuredClone === 'undefined') {
+            globalThis.structuredClone = function(value) {
+                return JSON.parse(JSON.stringify(value));
+            };
+        }
+
+        // String.prototype.replaceAll — trivial polyfill
+        if (typeof String.prototype.replaceAll === 'undefined') {
+            String.prototype.replaceAll = function(search, replacement) {
+                if (search instanceof RegExp) {
+                    if (!search.global) {
+                        throw new TypeError('String.prototype.replaceAll called with a non-global RegExp argument');
+                    }
+                    return this.replace(search, replacement);
+                }
+                return this.split(search).join(replacement);
+            };
+        }
+
+        // Array.prototype.at — trivial polyfill
+        if (typeof Array.prototype.at === 'undefined') {
+            Array.prototype.at = function(index) {
+                var len = this.length;
+                var relativeIndex = Number(index) || 0;
+                if (relativeIndex < 0) relativeIndex += len;
+                if (relativeIndex < 0 || relativeIndex >= len) return undefined;
+                return this[relativeIndex];
+            };
+        }
+        "#;
+
+        self.context.with(|ctx| -> rquickjs::Result<()> {
+            let _: Value = ctx.eval(code)?;
+            Ok(())
+        }).map_err(|e| anyhow!("Failed to setup P0 polyfills: {:?}", e))?;
+        Ok(())
+    }
 }
+

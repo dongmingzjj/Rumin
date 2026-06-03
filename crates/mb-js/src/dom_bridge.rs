@@ -405,9 +405,10 @@ globalThis.document = {{
     nodeName: '#document',
     get title() {{ return this._title; }},
     set title(v) {{ this._title = String(v); }},
-    get head() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_head_id__) : null; }},
-    get body() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_body_id__) : null; }},
-    get documentElement() {{ return (typeof __dom_node_name__ === 'function') ? __dom_node_name__(__dom_html_id__) : null; }},
+    _head: null, _body: null, _documentElement: null,
+    get head() {{ if (!this._head && typeof __dom_node_name__ === 'function') this._head = __dom_node_name__(__dom_head_id__); return this._head; }},
+    get body() {{ if (!this._body && typeof __dom_node_name__ === 'function') this._body = __dom_node_name__(__dom_body_id__); return this._body; }},
+    get documentElement() {{ if (!this._documentElement && typeof __dom_node_name__ === 'function') this._documentElement = __dom_node_name__(__dom_html_id__); return this._documentElement; }},
     get cookie() {{ return (typeof _get_cookies === 'function') ? _get_cookies() : ''; }},
     set cookie(v) {{ if (typeof _set_cookie === 'function') _set_cookie(v); }},
     getElementById: function(id) {{
@@ -472,7 +473,7 @@ globalThis.document = {{
         var newId = 'created_' + (++this._createCounter);
         var el = {{
             tagName: tag.toUpperCase(), id: "", className: "",
-            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _nodeId: 0, _createdId: newId, _parentId: null, _childNodesIds: [],
             _textContent: "", _innerHTML: "",
             _attrs: {{}}, style: {{}}
         }};
@@ -484,7 +485,7 @@ globalThis.document = {{
         var newId = 'created_' + (++this._createCounter);
         var frag = {{
             nodeType: 11, nodeName: '#document-fragment', nodeValue: null,
-            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _nodeId: 0, _createdId: newId, _parentId: null, _childNodesIds: [],
             _textContent: "", _innerHTML: "",
             _attrs: {{}}, style: {{}}
         }};
@@ -496,7 +497,7 @@ globalThis.document = {{
         var newId = 'created_' + (++this._createCounter);
         var comment = {{
             nodeType: 8, nodeName: '#comment', nodeValue: String(data || ''),
-            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _nodeId: 0, _createdId: newId, _parentId: null, _childNodesIds: [],
             _textContent: String(data || ''), _innerHTML: "",
             _attrs: {{}}, style: {{}}
         }};
@@ -508,7 +509,7 @@ globalThis.document = {{
         var newId = 'created_' + (++this._createCounter);
         var text = {{
             nodeType: 3, nodeName: '#text', nodeValue: String(data || ''),
-            _nodeId: 0, _parentId: null, _childNodesIds: [],
+            _nodeId: 0, _createdId: newId, _parentId: null, _childNodesIds: [],
             _textContent: String(data || ''), _innerHTML: "",
             _attrs: {{}}, style: {{}}
         }};
@@ -742,14 +743,14 @@ globalThis.document = {{
         // Shared prototype for all DOM elements — add methods here once, all elements inherit them
         var __dom_element_proto__ = {
             appendChild: function(child) {
-                var childId = child._nodeId;
+                var childId = child._nodeId || child._createdId;
                 if (childId) {
-                    __mut_append_child__(this._nodeId, childId);
+                    __mut_append_child__(this._nodeId || this._createdId, childId);
                 } else {
-                    __mut_append_child__(this._nodeId, child.tagName);
+                    __mut_append_child__(this._nodeId || this._createdId, child.tagName);
                 }
                 this._childNodesIds.push(childId || 0);
-                child._parentId = this._nodeId;
+                child._parentId = this._nodeId || this._createdId;
                 // Detect dynamic script insertion
                 if (child.tagName === 'SCRIPT') {
                     var scriptSrc = child.src || (child._attrs && child._attrs.src) || '';
@@ -809,6 +810,9 @@ globalThis.document = {{
                 }
             },
             cloneNode: function(deep) {
+                // Generate a new ID for the clone
+                var _cloneCounter = (globalThis.__cloneCounter = (globalThis.__cloneCounter || 0) + 1);
+                var cloneId = 'cloned_' + _cloneCounter;
                 var clone = {
                     tagName: this.tagName, id: this.id || '', className: this.className || '',
                     _nodeId: 0, _parentId: null, _childNodesIds: [],
@@ -817,15 +821,20 @@ globalThis.document = {{
                     style: JSON.parse(JSON.stringify(this.style || {}))
                 };
                 Object.setPrototypeOf(clone, __dom_element_proto__);
+                // Register clone in __dom_elements__
+                if (typeof __dom_elements__ !== 'undefined') __dom_elements__[cloneId] = clone;
                 if (deep) {
                     var kids = this._childNodesIds || [];
                     for (var i = 0; i < kids.length; i++) {
                         var child = __dom_elements__[kids[i]];
                         if (child && typeof child.cloneNode === 'function') {
-                            clone._childNodesIds.push(0);
+                            var childClone = child.cloneNode(true);
+                            childClone._parentId = cloneId;
+                            clone._childNodesIds.push(childClone._nodeId || childClone._clonedId || ('cloned_' + globalThis.__cloneCounter));
                         }
                     }
                 }
+                clone._clonedId = cloneId;
                 return clone;
             },
             addEventListener: function(type, listener) {

@@ -264,6 +264,7 @@ impl JsEngine {
         self.setup_chrome()?;
         self.setup_performance()?;
         self.setup_misc()?;
+        self.setup_p0_polyfills()?;
         self.setup_events()?;
         self.setup_animation_frames()?;
         self.setup_intersection_observer()?;
