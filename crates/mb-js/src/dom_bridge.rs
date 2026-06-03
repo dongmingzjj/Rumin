@@ -556,6 +556,28 @@ globalThis.document = {{
             stopImmediatePropagation: function() {{}}
         }};
     }},
+    _listeners: {{}},
+    addEventListener: function(type, fn) {{
+        if (!this._listeners[type]) this._listeners[type] = [];
+        this._listeners[type].push(fn);
+    }},
+    removeEventListener: function(type, fn) {{
+        if (this._listeners[type]) {{
+            var idx = this._listeners[type].indexOf(fn);
+            if (idx >= 0) this._listeners[type].splice(idx, 1);
+        }}
+    }},
+    dispatchEvent: function(evt) {{
+        if (this._listeners[evt.type]) {{
+            var self = this;
+            this._listeners[evt.type].forEach(function(fn) {{ fn.call(self, evt); }});
+        }}
+        return true;
+    }},
+    readyState: 'complete',
+    visibilityState: 'visible',
+    hidden: false,
+    hasFocus: function() {{ return true; }},
     _createCounter: 0
 }};
 "#,
@@ -885,6 +907,101 @@ globalThis.document = {{
                 var voidTags = {area:1,base:1,br:1,col:1,embed:1,hr:1,img:1,input:1,link:1,meta:1,param:1,source:1,track:1,wbr:1};
                 if (voidTags[tag]) return '<' + tag + attrs + '>';
                 return '<' + tag + attrs + '>' + (this.innerHTML || '') + '</' + tag + '>';
+            },
+            get parentElement() {
+                return this._parentId ? __dom_elements__[this._parentId] : null;
+            },
+            get dataset() {
+                var ds = {};
+                var attrs = this._attributes || this._attrs || {};
+                for (var k in attrs) {
+                    if (k.startsWith('data-')) {
+                        var key = k.substring(5).replace(/-([a-z])/g, function(m, c) { return c.toUpperCase(); });
+                        ds[key] = attrs[k];
+                    }
+                }
+                return ds;
+            },
+            get classList() {
+                var self = this;
+                var classes = (self.className || '').split(' ').filter(function(c) { return c; });
+                return {
+                    add: function(c) { if (!classes.includes(c)) { classes.push(c); self.className = classes.join(' '); } },
+                    remove: function(c) { classes = classes.filter(function(x) { return x !== c; }); self.className = classes.join(' '); },
+                    contains: function(c) { return classes.indexOf(c) >= 0; },
+                    toggle: function(c) { if (classes.includes(c)) { this.remove(c); return false; } else { this.add(c); return true; } },
+                    toString: function() { return classes.join(' '); }
+                };
+            },
+            getBoundingClientRect: function() {
+                return { top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0, x: 0, y: 0 };
+            },
+            getClientRects: function() {
+                return [];
+            },
+            get offsetWidth() { return 0; },
+            get offsetHeight() { return 0; },
+            get clientWidth() { return 0; },
+            get clientHeight() { return 0; },
+            get scrollWidth() { return 0; },
+            get scrollHeight() { return 0; },
+            get ownerDocument() { return typeof document !== 'undefined' ? document : null; },
+            insertAdjacentHTML: function(position, html) {
+                // simplified implementation
+            },
+            getElementsByTagName: function(tag) {
+                tag = (tag || "*").toUpperCase();
+                var result = [];
+                var walk = function(node) {
+                    var kids = node._childNodesIds || node.childNodes || [];
+                    for (var i = 0; i < kids.length; i++) {
+                        var child = typeof kids[i] === 'object' ? kids[i] : __dom_elements__[kids[i]];
+                        if (child) {
+                            if (child.tagName && (child.tagName === tag || tag === "*")) result.push(child);
+                            var sub = child.getElementsByTagName ? child.getElementsByTagName(tag) : [];
+                            for (var j = 0; j < sub.length; j++) result.push(sub[j]);
+                        }
+                    }
+                };
+                walk(this);
+                return result;
+            },
+            getElementsByClassName: function(cls) {
+                var result = [];
+                var walk = function(node) {
+                    var kids = node._childNodesIds || node.childNodes || [];
+                    for (var i = 0; i < kids.length; i++) {
+                        var child = typeof kids[i] === 'object' ? kids[i] : __dom_elements__[kids[i]];
+                        if (child) {
+                            if (child.className && child.className.split && child.className.split(' ').indexOf(cls) >= 0) result.push(child);
+                            var sub = child.getElementsByClassName ? child.getElementsByClassName(cls) : [];
+                            for (var j = 0; j < sub.length; j++) result.push(sub[j]);
+                        }
+                    }
+                };
+                walk(this);
+                return result;
+            },
+            querySelector: function(sel) {
+                if (typeof _dom_query_selector_all === 'function') {
+                    var ids = _dom_query_selector_all(sel);
+                    if (ids && ids.length > 0) return __dom_elements__[ids[0]] || null;
+                }
+                return null;
+            },
+            querySelectorAll: function(sel) {
+                if (typeof _dom_query_selector_all === 'function') {
+                    var ids = _dom_query_selector_all(sel);
+                    var result = [];
+                    if (ids) {
+                        for (var i = 0; i < ids.length; i++) {
+                            var el = __dom_elements__[ids[i]];
+                            if (el) result.push(el);
+                        }
+                    }
+                    return result;
+                }
+                return [];
             }
         };
         "#;

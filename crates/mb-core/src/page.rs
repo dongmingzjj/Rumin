@@ -193,6 +193,118 @@ impl Page {
         // Execute any dynamically queued scripts (from event handlers, etc.)
         self.execute_dynamic_scripts();
 
+        // Drain timer callbacks (setInterval/setTimeout) — needed for WAF challenges
+        // that use setInterval to wait for async operations
+        if let Err(e) = self.js.drain_and_execute_timers() {
+            tracing::debug!("Timer drain: {}", e);
+        }
+
+        // WAF challenge reload loop — if scripts called location.reload(), re-navigate
+        const MAX_RELOAD_ROUNDS: usize = 5;
+        for reload_round in 0..MAX_RELOAD_ROUNDS {
+            let should_reload = self.js.eval(
+                "typeof __location_reload__ !== 'undefined' && __location_reload__"
+            ).unwrap_or_default();
+
+            if should_reload != "true" {
+                break;
+            }
+
+            // Get target URL (may be original or new URL)
+            let target = self.js.eval(
+                "(typeof __location_href_target__ !== 'undefined' && __location_href_target__) ? __location_href_target__ : ''"
+            ).unwrap_or_default();
+
+            let reload_url = if !target.is_empty() && target != "undefined" && target != "null" {
+                target
+            } else {
+                self.url.clone()
+            };
+
+            tracing::info!("WAF challenge reload #{}: navigating to {}", reload_round + 1, reload_url);
+
+            // Re-fetch and re-parse (cookie jar is shared via Arc<Mutex>)
+            let response = self.client.get(&reload_url).await
+                .context("WAF reload HTTP request failed")?;
+            self.status = response.status_code();
+            let html = response.text()
+                .context("Failed to decode WAF reload body")?;
+            self.html = html.clone();
+            self.url = reload_url.clone();
+
+            // Re-parse DOM
+            self.dom = HtmlParser::parse(&html, &self.url)
+                .context("WAF reload HTML parsing failed")?;
+
+            // Update document URL
+            if let Some(doc_data) = self.dom.get_node_mut(self.dom.document_node).kind.as_document_mut() {
+                doc_data.url = self.url.clone();
+            }
+
+            // Rebuild JS engine (cookie jar persists via Arc<Mutex>)
+            mb_js::xhr::clear_xhr_instances();
+            self.js = JsEngine::new_with_defaults();
+
+            let preset = self.client.config().emulation;
+            self.js.setup_navigator_with_overrides(preset.user_agent(), preset.platform())?;
+            self.js.setup_anti_detect()?;
+            self.js.setup_location(&self.url)?;
+            self.js.bind_dom(&self.dom)?;
+            self.js.setup_canvas_after_dom()?;
+
+            if let Err(e) = self.js.setup_xhr(Arc::clone(&self.client)) {
+                tracing::warn!("Failed to setup XHR: {}", e);
+            }
+            if let Err(e) = self.js.setup_websocket() {
+                tracing::warn!("Failed to setup WebSocket: {}", e);
+            }
+            if let Err(e) = self.js.set_cookie_jar(Arc::clone(&self.cookies), &self.url) {
+                tracing::warn!("Failed to setup cookies: {}", e);
+            }
+
+            // Execute scripts again
+            let scripts = HtmlParser::collect_scripts(&self.dom);
+            let mut external_urls: Vec<String> = Vec::new();
+            for script in &scripts {
+                if let Some(inline) = &script.inline_content {
+                    if let Err(e) = self.js.eval(inline) {
+                        tracing::warn!("WAF reload inline script error: {}", e);
+                    }
+                } else if let Some(src) = &script.src {
+                    let script_url = resolve_script_url(&self.url, src);
+                    external_urls.push(script_url);
+                }
+            }
+
+            if !external_urls.is_empty() {
+                let downloads: Vec<_> = external_urls
+                    .iter()
+                    .map(|url| self.client.get(url))
+                    .collect();
+                let results = futures_util::future::join_all(downloads).await;
+                for (script_url, result) in external_urls.iter().zip(results.into_iter()) {
+                    if let Ok(response) = result {
+                        if response.is_success() {
+                            if let Ok(code) = response.text() {
+                                if let Err(e) = self.js.eval(&code) {
+                                    tracing::warn!("WAF reload external script error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Re-trigger events
+            if let Err(e) = self.js.eval("document.dispatchEvent(new Event('DOMContentLoaded'))") {
+                tracing::debug!("WAF reload DOMContentLoaded: {}", e);
+            }
+            if let Err(e) = self.js.eval("window.dispatchEvent(new Event('load'))") {
+                tracing::debug!("WAF reload load: {}", e);
+            }
+            self.execute_dynamic_scripts();
+        }
+
         Ok(())
     }
 

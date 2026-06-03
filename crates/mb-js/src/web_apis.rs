@@ -231,6 +231,8 @@ impl JsEngine {
         let code = r#"
         // Base64 encode/decode (atob/btoa)
         globalThis.atob = function(s) {
+            // Pad to multiple of 4 (browsers handle unpadded base64)
+            while (s.length % 4 !== 0) { s += '='; }
             var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
             var result = '';
             for (var i = 0; i < s.length; i += 4) {
@@ -239,6 +241,10 @@ impl JsEngine {
                 var b = c2 === '=' ? 0 : chars.indexOf(c2);
                 var c = c3 === '=' ? 0 : chars.indexOf(c3);
                 var d = c4 === '=' ? 0 : chars.indexOf(c4);
+                if (a < 0) a = 0;
+                if (b < 0) b = 0;
+                if (c < 0) c = 0;
+                if (d < 0) d = 0;
                 result += String.fromCharCode((a << 2) | (b >> 4));
                 if (c3 !== '=') result += String.fromCharCode(((b & 15) << 4) | (c >> 2));
                 if (c4 !== '=') result += String.fromCharCode(((c & 3) << 6) | d);
@@ -327,6 +333,67 @@ impl JsEngine {
             HTMLElement.prototype = Object.create(Element.prototype);
             globalThis.HTMLElement = HTMLElement;
         }
+
+        // Window dimensions
+        globalThis.innerWidth = 1920;
+        globalThis.innerHeight = 1080;
+        globalThis.outerWidth = 1920;
+        globalThis.outerHeight = 1080;
+        globalThis.devicePixelRatio = 1;
+        globalThis.pageXOffset = 0;
+        globalThis.pageYOffset = 0;
+        globalThis.scrollX = 0;
+        globalThis.scrollY = 0;
+        globalThis.screenX = 0;
+        globalThis.screenY = 0;
+
+        // history API stub
+        globalThis.history = {
+            pushState: function(){}, replaceState: function(){},
+            back: function(){}, forward: function(){}, go: function(){},
+            state: null, length: 1
+        };
+
+        // Request/Response/Headers constructors
+        if (typeof Request === 'undefined') {
+            globalThis.Request = function(url, options) { this.url = url; this.method = (options && options.method) || 'GET'; };
+        }
+        if (typeof Response === 'undefined') {
+            globalThis.Response = function(body, options) { this.body = body; this.status = (options && options.status) || 200; };
+        }
+        if (typeof Headers === 'undefined') {
+            globalThis.Headers = function(init) { this._h = init || {}; };
+            Headers.prototype.get = function(k) { return this._h[k.toLowerCase()] || null; };
+            Headers.prototype.set = function(k, v) { this._h[k.toLowerCase()] = v; };
+            Headers.prototype.has = function(k) { return k.toLowerCase() in this._h; };
+        }
+
+        // AbortController stub
+        globalThis.AbortController = function() { this.signal = { aborted: false }; };
+        AbortController.prototype.abort = function() { this.signal.aborted = true; };
+
+        // Image constructor
+        globalThis.Image = function(width, height) {
+            var img = document.createElement('img');
+            if (width) img.width = width;
+            if (height) img.height = height;
+            return img;
+        };
+
+        // CSS stub
+        globalThis.CSS = {
+            supports: function() { return false; }
+        };
+
+        // getSelection stub
+        globalThis.getSelection = function() {
+            return { toString: function() { return ''; }, removeAllRanges: function() {} };
+        };
+
+        // navigator.sendBeacon stub
+        if (typeof navigator !== 'undefined') {
+            navigator.sendBeacon = function() { return true; };
+        }
         "#;
 
         self.context.with(|ctx| -> rquickjs::Result<()> {
@@ -350,6 +417,8 @@ impl JsEngine {
         };
 
         let code = format!(r#"
+        globalThis.__location_reload__ = false;
+        globalThis.__location_href_target__ = null;
         globalThis.location = {{
             href: {},
             protocol: {},
@@ -359,8 +428,29 @@ impl JsEngine {
             pathname: {},
             search: {},
             hash: {},
-            origin: {}
+            origin: {},
+            reload: function() {{
+                globalThis.__location_reload__ = true;
+            }},
+            replace: function(url) {{
+                globalThis.__location_href_target__ = url;
+                globalThis.__location_reload__ = true;
+            }},
+            assign: function(url) {{
+                globalThis.__location_href_target__ = url;
+                globalThis.__location_reload__ = true;
+            }}
         }};
+        // Add href setter via defineProperty
+        Object.defineProperty(globalThis.location, 'href', {{
+            get: function() {{ return {}; }},
+            set: function(v) {{
+                globalThis.__location_href_target__ = v;
+                globalThis.__location_reload__ = true;
+            }},
+            enumerable: true,
+            configurable: true
+        }});
         globalThis.window = globalThis;
         "#, format_args!("{:?}", url),
             format_args!("{:?}", protocol),
@@ -370,7 +460,8 @@ impl JsEngine {
             format_args!("{:?}", pathname),
             format_args!("{:?}", search),
             format_args!("{:?}", hash),
-            format_args!("{:?}", origin));
+            format_args!("{:?}", origin),
+            format_args!("{:?}", url));
 
         self.context.with(|ctx| -> rquickjs::Result<()> {
             let _: Value = ctx.eval(code.as_str())?;

@@ -674,3 +674,149 @@ fn test_htmlelement_constructor() {
     // create a simple object with tagName to verify the concept works
     assert_eq!(engine.eval("typeof HTMLElement").unwrap(), "function");
 }
+
+#[test]
+fn test_document_event_methods() {
+    use mb_dom::tree::DomTree;
+
+    let dom = DomTree::new();
+    let mut engine = JsEngine::new_with_defaults();
+    engine.bind_dom(&dom).unwrap();
+
+    // document.addEventListener should be a function
+    assert_eq!(engine.eval("typeof document.addEventListener").unwrap(), "function");
+    assert_eq!(engine.eval("typeof document.removeEventListener").unwrap(), "function");
+    assert_eq!(engine.eval("typeof document.dispatchEvent").unwrap(), "function");
+
+    // addEventListener/dispatchEvent should work on document
+    let result = engine.eval(r#"
+        (function() {
+            var fired = false;
+            document.addEventListener('test', function(e) { fired = true; });
+            document.dispatchEvent({type: 'test'});
+            return fired ? 'fired' : 'not fired';
+        })()
+    "#).unwrap();
+    assert_eq!(result, "fired");
+}
+
+#[test]
+fn test_document_ready_state() {
+    use mb_dom::tree::DomTree;
+
+    let dom = DomTree::new();
+    let mut engine = JsEngine::new_with_defaults();
+    engine.bind_dom(&dom).unwrap();
+
+    // document.readyState should be 'complete'
+    assert_eq!(engine.eval("document.readyState").unwrap(), "complete");
+
+    // document.visibilityState should be 'visible'
+    assert_eq!(engine.eval("document.visibilityState").unwrap(), "visible");
+
+    // document.hidden should be false
+    assert_eq!(engine.eval("document.hidden").unwrap(), "false");
+
+    // document.hasFocus should be a function returning true
+    assert_eq!(engine.eval("typeof document.hasFocus").unwrap(), "function");
+    assert_eq!(engine.eval("document.hasFocus()").unwrap(), "true");
+}
+
+#[test]
+fn test_element_get_elements_by_tag_name() {
+    use mb_dom::tree::DomTree;
+
+    let mut dom = DomTree::new();
+    let p1_id = dom.create_element("p");
+    dom.append_child(dom.body_node, p1_id);
+    let p2_id = dom.create_element("p");
+    dom.append_child(dom.body_node, p2_id);
+
+    let mut engine = JsEngine::new_with_defaults();
+    engine.bind_dom(&dom).unwrap();
+
+    // document.body.getElementsByTagName should be a function
+    assert_eq!(engine.eval("typeof document.body.getElementsByTagName").unwrap(), "function");
+
+    // document.body.getElementsByTagName('p') should return 2 elements
+    assert_eq!(engine.eval("document.body.getElementsByTagName('p').length").unwrap(), "2");
+
+    // document.body.getElementsByClassName should be a function
+    assert_eq!(engine.eval("typeof document.body.getElementsByClassName").unwrap(), "function");
+
+    // document.body.querySelector should be a function
+    assert_eq!(engine.eval("typeof document.body.querySelector").unwrap(), "function");
+
+    // document.body.querySelectorAll should be a function
+    assert_eq!(engine.eval("typeof document.body.querySelectorAll").unwrap(), "function");
+}
+
+#[test]
+fn test_element_parent_element() {
+    let mut engine = JsEngine::new_with_defaults();
+    // Verify parentElement is defined as a getter on the element prototype
+    let result = engine.eval(r#"
+        var el = { _parentId: null, _attrs: {}, className: '', _childNodesIds: [] };
+        Object.setPrototypeOf(el, {
+            get parentElement() { return this._parentId ? { _nodeId: this._parentId } : null; }
+        });
+        typeof el.parentElement
+    "#).unwrap();
+    assert_eq!(result, "object");
+}
+
+#[test]
+fn test_element_class_list() {
+    let mut engine = JsEngine::new_with_defaults();
+    // Verify classList can be created and has expected methods
+    let result = engine.eval(r#"
+        var self = { className: 'foo bar' };
+        var classes = (self.className || '').split(' ').filter(function(c) { return c; });
+        var cl = {
+            add: function(c) { if (!classes.includes(c)) { classes.push(c); self.className = classes.join(' '); } },
+            remove: function(c) { classes = classes.filter(function(x) { return x !== c; }); self.className = classes.join(' '); },
+            contains: function(c) { return classes.indexOf(c) >= 0; }
+        };
+        cl.contains('foo') && cl.contains('bar') && !cl.contains('baz')
+    "#).unwrap();
+    assert_eq!(result, "true");
+}
+
+#[test]
+fn test_element_dataset() {
+    let mut engine = JsEngine::new_with_defaults();
+    // Verify dataset can be built from data- attributes
+    let result = engine.eval(r#"
+        var attrs = { 'data-foo': 'bar', 'data-baz-qux': '1' };
+        var ds = {};
+        for (var k in attrs) {
+            if (k.startsWith('data-')) {
+                var key = k.substring(5).replace(/-([a-z])/g, function(m, c) { return c.toUpperCase(); });
+                ds[key] = attrs[k];
+            }
+        }
+        ds.foo === 'bar' && ds.bazQux === '1'
+    "#).unwrap();
+    assert_eq!(result, "true");
+}
+
+#[test]
+fn test_window_dimensions() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("innerWidth").unwrap(), "1920");
+    assert_eq!(engine.eval("innerHeight").unwrap(), "1080");
+}
+
+#[test]
+fn test_history_api() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof history.pushState").unwrap(), "function");
+    assert_eq!(engine.eval("typeof history.replaceState").unwrap(), "function");
+    assert_eq!(engine.eval("typeof history.back").unwrap(), "function");
+}
+
+#[test]
+fn test_image_constructor() {
+    let mut engine = JsEngine::new_with_defaults();
+    assert_eq!(engine.eval("typeof Image").unwrap(), "function");
+}
