@@ -30,6 +30,7 @@ pub mod animation;
 pub mod mutation_observer;
 pub mod intersection_observer;
 pub mod anti_detect;
+pub mod stealth;
 pub mod intl;
 pub mod indexed_db;
 pub mod websocket;
@@ -277,6 +278,7 @@ impl JsEngine {
         self.setup_crypto_api()?;
         self.setup_dom_parser()?;
         self.setup_blob_formdata()?;
+        self.setup_stealth()?;
         Ok(())
     }
 
