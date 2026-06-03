@@ -322,7 +322,7 @@ impl JsEngine {
             };
 
             // Phase 1.5: Drain all pending microtasks (multiple rounds)
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 if !ctx.execute_pending_job() {
                     break;
                 }

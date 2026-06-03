@@ -549,6 +549,57 @@ impl JsEngine {
                 return this[relativeIndex];
             };
         }
+
+        // MessageChannel / MessagePort — React 18 scheduler uses this for task scheduling
+        if (typeof globalThis.MessageChannel === 'undefined') {
+            globalThis.MessageChannel = function() {
+                var ports = [{}, {}];
+                this.port1 = ports[0];
+                this.port2 = ports[1];
+                ports[0]._other = ports[1];
+                ports[1]._other = ports[0];
+                ports[0]._listeners = {};
+                ports[1]._listeners = {};
+                function makePort(port) {
+                    port.postMessage = function(data) {
+                        var other = port._other;
+                        if (other && other._listeners && other._listeners.message) {
+                            var evt = {data: data, type: 'message'};
+                            setTimeout(function() {
+                                var fns = other._listeners.message;
+                                for (var i = 0; i < fns.length; i++) fns[i](evt);
+                            }, 0);
+                        }
+                    };
+                    port.addEventListener = function(type, fn) {
+                        if (!port._listeners[type]) port._listeners[type] = [];
+                        port._listeners[type].push(fn);
+                    };
+                    port.removeEventListener = function(type, fn) {
+                        if (port._listeners[type]) {
+                            var arr = port._listeners[type];
+                            var idx = arr.indexOf(fn);
+                            if (idx >= 0) arr.splice(idx, 1);
+                        }
+                    };
+                    port.start = function() {};
+                    port.close = function() {};
+                }
+                makePort(ports[0]);
+                makePort(ports[1]);
+            };
+        }
+
+        // requestIdleCallback — React scheduler fallback
+        if (typeof globalThis.requestIdleCallback === 'undefined') {
+            globalThis.requestIdleCallback = function(cb) {
+                var start = Date.now();
+                return setTimeout(function() {
+                    cb({didTimeout: false, timeRemaining: function() { return Math.max(0, 50 - (Date.now() - start)); }});
+                }, 1);
+            };
+            globalThis.cancelIdleCallback = function(id) { clearTimeout(id); };
+        }
         "#;
 
         self.context.with(|ctx| -> rquickjs::Result<()> {
