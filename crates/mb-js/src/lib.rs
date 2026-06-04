@@ -41,6 +41,7 @@ pub mod url_api;
 pub mod crypto_api;
 pub mod dom_parser;
 pub mod blob_formdata;
+pub mod fetch_api;
 
 pub use dom_bridge::{Mutation, MutationKind};
 pub use timers::PendingCallback;
@@ -597,6 +598,12 @@ impl JsEngine {
     pub fn setup_xhr(&mut self, client: std::sync::Arc<mb_network::client::HttpClient>) -> Result<()> {
         let handle = tokio::runtime::Handle::current();
         xhr::register_xhr(&self.context, client, handle)
+    }
+
+    /// Setup fetch API support with the given HTTP client
+    pub fn setup_fetch(&mut self, client: std::sync::Arc<mb_network::client::HttpClient>) -> Result<()> {
+        let handle = tokio::runtime::Handle::current();
+        fetch_api::register_fetch(&self.context, client, handle)
     }
 
     /// Setup WebSocket support with real network connections

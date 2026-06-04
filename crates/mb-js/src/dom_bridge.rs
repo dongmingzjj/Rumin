@@ -294,6 +294,9 @@ impl JsEngine {
         // 0. Setup mutation queue (must be done before elements are created)
         self.setup_mutation_queue()?;
 
+        // 0.1 修补变更辅助函数以通知 MutationObserver（必须在 setup_mutation_queue 之后）
+        self.patch_mutation_helpers_for_observer()?;
+
         // 1. Serialize all element nodes and populate DOM_ELEMENTS for native selectors
         let mut elements_js = Vec::new();
         let mut prop_defs_js = Vec::new();

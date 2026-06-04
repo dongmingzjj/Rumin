@@ -115,6 +115,11 @@ impl Page {
             tracing::warn!("Failed to setup XHR: {}", e);
         }
 
+        // 5b2. Setup fetch API support
+        if let Err(e) = self.js.setup_fetch(Arc::clone(&self.client)) {
+            tracing::warn!("Failed to setup fetch API: {}", e);
+        }
+
         // 5c. Setup WebSocket support
         if let Err(e) = self.js.setup_websocket() {
             tracing::warn!("Failed to setup WebSocket: {}", e);
@@ -256,6 +261,9 @@ impl Page {
 
             if let Err(e) = self.js.setup_xhr(Arc::clone(&self.client)) {
                 tracing::warn!("Failed to setup XHR: {}", e);
+            }
+            if let Err(e) = self.js.setup_fetch(Arc::clone(&self.client)) {
+                tracing::warn!("Failed to setup fetch API: {}", e);
             }
             if let Err(e) = self.js.setup_websocket() {
                 tracing::warn!("Failed to setup WebSocket: {}", e);

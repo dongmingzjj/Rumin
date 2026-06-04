@@ -52,7 +52,7 @@ fn is_private_ip(ip_str: &str) -> bool {
 
 /// Check if a URL targets a private/internal IP address.
 /// Returns true only if the host is a literal IP in a private range.
-fn url_targets_private_ip(url_str: &str) -> bool {
+pub(crate) fn url_targets_private_ip(url_str: &str) -> bool {
     if let Ok(parsed) = url::Url::parse(url_str) {
         if let Some(host) = parsed.host_str() {
             return is_private_ip(host);
