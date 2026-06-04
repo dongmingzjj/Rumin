@@ -9,6 +9,7 @@ use mb_html::parser::HtmlParser;
 use mb_js::{JsEngine, Mutation, MutationKind};
 use mb_network::client::HttpClient;
 use mb_network::cookie::CookieJar;
+use mb_network::HttpRequest;
 
 /// Resolve a script URL relative to a base URL.
 fn resolve_script_url(base: &str, relative: &str) -> String {
@@ -72,8 +73,11 @@ impl Page {
     pub async fn navigate(&mut self, url: &str) -> Result<()> {
         self.url = url.to_string();
 
-        // 1. Fetch the page
-        let response = self.client.get(url).await
+        // 1. Fetch the page（顶层导航请求，添加浏览器原生 headers）
+        let request = HttpRequest::get(url)
+            .header("sec-fetch-user", "?1")
+            .header("upgrade-insecure-requests", "1");
+        let response = self.client.execute(request).await
             .context("HTTP request failed")?;
 
         // Store the status code — 404 etc. are valid responses, not errors
@@ -230,7 +234,11 @@ impl Page {
             tracing::info!("WAF challenge reload #{}: navigating to {}", reload_round + 1, reload_url);
 
             // Re-fetch and re-parse (cookie jar is shared via Arc<Mutex>)
-            let response = self.client.get(&reload_url).await
+            // WAF 重载也是顶层导航，添加同样的浏览器原生 headers
+            let request = HttpRequest::get(&reload_url)
+                .header("sec-fetch-user", "?1")
+                .header("upgrade-insecure-requests", "1");
+            let response = self.client.execute(request).await
                 .context("WAF reload HTTP request failed")?;
             self.status = response.status_code();
             let html = response.text()
