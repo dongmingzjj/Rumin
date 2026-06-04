@@ -134,35 +134,24 @@ impl Page {
             tracing::warn!("Failed to setup cookies: {}", e);
         }
 
-        // 6. Collect and execute scripts (inline + external)
+        // 6. Collect and execute scripts (inline + external) in document order
+        // 修复：先并发下载所有外部脚本，再按文档顺序依次执行
+        // 这确保了外部脚本（如定义全局变量的）在后续 inline 脚本之前执行
         let scripts = HtmlParser::collect_scripts(&self.dom);
 
-        // First, execute all inline scripts immediately and collect external script URLs
+        // 第一步：收集所有外部脚本 URL 并发下载
         let mut external_urls: Vec<String> = Vec::new();
         for script in &scripts {
-            if let Some(inline) = &script.inline_content {
-                tracing::debug!("Executing inline script ({} bytes)", inline.len());
-                if let Err(e) = self.js.eval(inline) {
-                    tracing::warn!("Inline script error: {}", e);
+            if script.inline_content.is_none() {
+                if let Some(src) = &script.src {
+                    let script_url = resolve_script_url(&self.url, src);
+                    external_urls.push(script_url);
                 }
-            } else if let Some(src) = &script.src {
-                let script_url = if src.starts_with("http") {
-                    src.clone()
-                } else if src.starts_with("//") {
-                    format!("https:{}", src)
-                } else if src.starts_with('/') {
-                    let base = url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("https://example.com").unwrap());
-                    format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), src)
-                } else {
-                    let base = url::Url::parse(&self.url).unwrap_or_else(|_| url::Url::parse("https://example.com").unwrap());
-                    let resolved = base.join(src).unwrap_or_else(|_| base.clone());
-                    resolved.to_string()
-                };
-                external_urls.push(script_url);
             }
         }
 
-        // Concurrently download all external scripts, then execute in order
+        // 并发下载所有外部脚本，建立 URL->代码 的映射
+        let mut external_code: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         if !external_urls.is_empty() {
             let downloads: Vec<_> = external_urls
                 .iter()
@@ -176,10 +165,7 @@ impl Page {
                         if response.is_success() {
                             match response.text() {
                                 Ok(code) => {
-                                    tracing::debug!("Executing external script ({} bytes) from {}", code.len(), script_url);
-                                    if let Err(e) = self.js.eval(&code) {
-                                        tracing::warn!("External script error: {}", e);
-                                    }
+                                    external_code.insert(script_url.clone(), code);
                                 }
                                 Err(e) => tracing::warn!("Failed to read script body from {}: {}", script_url, e),
                             }
@@ -188,6 +174,24 @@ impl Page {
                         }
                     }
                     Err(e) => tracing::warn!("Script download error for {}: {}", script_url, e),
+                }
+            }
+        }
+
+        // 第二步：按文档顺序依次执行所有脚本（保持原始顺序）
+        for script in &scripts {
+            if let Some(inline) = &script.inline_content {
+                tracing::debug!("Executing inline script ({} bytes)", inline.len());
+                if let Err(e) = self.js.eval(inline) {
+                    tracing::warn!("Inline script error: {}", e);
+                }
+            } else if let Some(src) = &script.src {
+                let script_url = resolve_script_url(&self.url, src);
+                if let Some(code) = external_code.get(&script_url) {
+                    tracing::debug!("Executing external script ({} bytes) from {}", code.len(), script_url);
+                    if let Err(e) = self.js.eval(code) {
+                        tracing::warn!("External script error: {}", e);
+                    }
                 }
             }
         }
@@ -280,20 +284,21 @@ impl Page {
                 tracing::warn!("Failed to setup cookies: {}", e);
             }
 
-            // Execute scripts again
+            // Execute scripts again（按文档顺序执行，同初始加载的修复）
             let scripts = HtmlParser::collect_scripts(&self.dom);
+
+            // 先并发下载所有外部脚本
             let mut external_urls: Vec<String> = Vec::new();
             for script in &scripts {
-                if let Some(inline) = &script.inline_content {
-                    if let Err(e) = self.js.eval(inline) {
-                        tracing::warn!("WAF reload inline script error: {}", e);
+                if script.inline_content.is_none() {
+                    if let Some(src) = &script.src {
+                        let script_url = resolve_script_url(&self.url, src);
+                        external_urls.push(script_url);
                     }
-                } else if let Some(src) = &script.src {
-                    let script_url = resolve_script_url(&self.url, src);
-                    external_urls.push(script_url);
                 }
             }
 
+            let mut external_code: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             if !external_urls.is_empty() {
                 let downloads: Vec<_> = external_urls
                     .iter()
@@ -304,10 +309,24 @@ impl Page {
                     if let Ok(response) = result {
                         if response.is_success() {
                             if let Ok(code) = response.text() {
-                                if let Err(e) = self.js.eval(&code) {
-                                    tracing::warn!("WAF reload external script error: {}", e);
-                                }
+                                external_code.insert(script_url.clone(), code);
                             }
+                        }
+                    }
+                }
+            }
+
+            // 按文档顺序依次执行所有脚本
+            for script in &scripts {
+                if let Some(inline) = &script.inline_content {
+                    if let Err(e) = self.js.eval(inline) {
+                        tracing::warn!("WAF reload inline script error: {}", e);
+                    }
+                } else if let Some(src) = &script.src {
+                    let script_url = resolve_script_url(&self.url, src);
+                    if let Some(code) = external_code.get(&script_url) {
+                        if let Err(e) = self.js.eval(code) {
+                            tracing::warn!("WAF reload external script error: {}", e);
                         }
                     }
                 }

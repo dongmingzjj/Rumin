@@ -489,6 +489,45 @@ globalThis.document = {{
         if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = el;
         return el;
     }},
+    createElementNS: function(namespace, qualifiedName) {{
+        var tag = String(qualifiedName || '').toLowerCase();
+        // SVG 命名空间：使用 SVG 构造函数（如果已注册）
+        if (namespace === 'http://www.w3.org/2000/svg' && typeof SVGElement !== 'undefined') {{
+            var newId = 'created_' + (++this._createCounter);
+            var el = {{
+                tagName: tag.toUpperCase(), id: "", className: "",
+                _nodeId: 0, _createdId: newId, _parentId: null, _childNodesIds: [],
+                _textContent: "", _innerHTML: "",
+                _attrs: {{}}, _namespaceURI: namespace, style: {{}}
+            }};
+            // 根据标签名选择正确的 SVG 子类型
+            var svgMap = {{'svg': typeof SVGSVGElement !== 'undefined' ? SVGSVGElement : SVGElement,
+                'circle': typeof SVGCircleElement !== 'undefined' ? SVGCircleElement : SVGElement,
+                'rect': typeof SVGRectElement !== 'undefined' ? SVGRectElement : SVGElement,
+                'path': typeof SVGPathElement !== 'undefined' ? SVGPathElement : SVGElement,
+                'g': typeof SVGGElement !== 'undefined' ? SVGGElement : SVGElement,
+                'text': typeof SVGTextElement !== 'undefined' ? SVGTextElement : SVGElement,
+                'line': typeof SVGLineElement !== 'undefined' ? SVGLineElement : SVGElement,
+                'ellipse': typeof SVGEllipseElement !== 'undefined' ? SVGEllipseElement : SVGElement,
+                'polyline': typeof SVGPolylineElement !== 'undefined' ? SVGPolylineElement : SVGElement,
+                'polygon': typeof SVGPolygonElement !== 'undefined' ? SVGPolygonElement : SVGElement}};
+            var Ctor = svgMap[tag] || SVGElement;
+            Object.setPrototypeOf(el, Ctor.prototype);
+            // 混入 __dom_element_proto__ 方法（appendChild 等）
+            if (typeof __dom_element_proto__ !== 'undefined') {{
+                var proto = __dom_element_proto__;
+                for (var k in proto) {{
+                    if (proto.hasOwnProperty(k) && typeof proto[k] === 'function' && !el.hasOwnProperty(k)) {{
+                        el[k] = proto[k];
+                    }}
+                }}
+            }}
+            if (typeof __dom_elements__ !== 'undefined') __dom_elements__[newId] = el;
+            return el;
+        }}
+        // 其他命名空间：回退到 createElement
+        return this.createElement(tag);
+    }},
     createDocumentFragment: function() {{
         var newId = 'created_' + (++this._createCounter);
         var frag = {{

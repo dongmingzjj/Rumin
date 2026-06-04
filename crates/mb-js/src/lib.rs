@@ -42,6 +42,7 @@ pub mod crypto_api;
 pub mod dom_parser;
 pub mod blob_formdata;
 pub mod fetch_api;
+pub mod svg;
 
 pub use dom_bridge::{Mutation, MutationKind};
 pub use timers::PendingCallback;
@@ -279,6 +280,7 @@ impl JsEngine {
         self.setup_crypto_api()?;
         self.setup_dom_parser()?;
         self.setup_blob_formdata()?;
+        self.setup_svg()?;
         self.setup_stealth()?;
         Ok(())
     }
