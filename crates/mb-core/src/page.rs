@@ -71,12 +71,19 @@ impl Page {
 
     /// Navigate to a URL: fetch → parse HTML → build DOM → collect scripts
     pub async fn navigate(&mut self, url: &str) -> Result<()> {
-        self.url = url.to_string();
-
-        // 1. Fetch the page（顶层导航请求，添加浏览器原生 headers）
         let request = HttpRequest::get(url)
             .header("sec-fetch-user", "?1")
             .header("upgrade-insecure-requests", "1");
+        self.navigate_with_request(request).await
+    }
+
+    /// 使用自定义 HttpRequest 导航（支持自定义 headers）
+    pub async fn navigate_with_request(&mut self, request: HttpRequest) -> Result<()> {
+        // 从 request 中获取 URL
+        let url = request.url.clone();
+        self.url = url.clone();
+
+        // 1. Fetch the page（使用传入的请求，支持自定义 headers）
         let response = self.client.execute(request).await
             .context("HTTP request failed")?;
 
@@ -89,7 +96,7 @@ impl Page {
         self.html = html.clone();
 
         // 2. Parse HTML into DOM
-        self.dom = HtmlParser::parse(&html, url)
+        self.dom = HtmlParser::parse(&html, &url)
             .context("HTML parsing failed")?;
 
         // 3. Update document URL
@@ -108,7 +115,7 @@ impl Page {
         self.js.setup_anti_detect()?;
         self.js.setup_stealth()?;
 
-        self.js.setup_location(url)?;
+        self.js.setup_location(&url)?;
 
         // 5. Inject DOM tree into JS environment
         self.js.bind_dom(&self.dom)?;

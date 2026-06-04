@@ -1068,6 +1068,8 @@ dependencies = [
  "mb-core",
  "mb-dom",
  "mb-network",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

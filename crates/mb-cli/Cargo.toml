@@ -12,6 +12,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 mb-core = { path = "../mb-core" }
 mb-dom = { path = "../mb-dom" }

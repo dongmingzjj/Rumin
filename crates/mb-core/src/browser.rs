@@ -10,12 +10,28 @@ use mb_network::interceptor::RequestLog;
 
 use crate::page::Page;
 
+/// 提取配置 — 告诉 navigate_all 在每个页面上执行什么提取操作
+#[derive(Debug, Clone, Default)]
+pub struct ExtractionConfig {
+    /// CSS 选择器
+    pub selector: Option<String>,
+    /// 是否选择所有匹配元素（而非仅第一个）
+    pub select_all: bool,
+    /// JavaScript 表达式
+    pub eval: Option<String>,
+    /// 提取指定属性值（配合 selector 使用）
+    pub attr: Option<String>,
+}
+
 /// Result of a single batch navigation
 #[derive(Debug, Serialize)]
 pub struct BatchResult {
     pub url: String,
     pub status: u16,
     pub title: String,
+    /// 提取结果（selector/eval 的输出）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extracted: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -100,6 +116,7 @@ impl Browser {
         &self,
         urls: Vec<String>,
         concurrency: usize,
+        extraction: Option<ExtractionConfig>,
     ) -> Vec<BatchResult> {
         let client = Arc::clone(&self.client);
         let cookies = Arc::clone(&self.cookies);
@@ -113,6 +130,7 @@ impl Browser {
                     let client = Arc::clone(&client);
                     let cookies = Arc::clone(&cookies);
                     let url = url.clone();
+                    let ext = extraction.clone();
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_multi_thread()
                             .worker_threads(1)
@@ -131,22 +149,32 @@ impl Browser {
                             .await;
 
                             match result {
-                                Ok(Ok(page)) => BatchResult {
-                                    url,
-                                    status: page.status,
-                                    title: page.dom_title(),
-                                    error: None,
+                                Ok(Ok(mut page)) => {
+                                    let status = page.status;
+                                    let title = page.dom_title();
+                                    let extracted = ext.and_then(|ext| {
+                                        Self::extract_from_page_static(&mut page, &ext)
+                                    });
+                                    BatchResult {
+                                        url,
+                                        status,
+                                        title,
+                                        extracted,
+                                        error: None,
+                                    }
                                 },
                                 Ok(Err(e)) => BatchResult {
                                     url,
                                     status: 0,
                                     title: String::new(),
+                                    extracted: None,
                                     error: Some(format!("{}", e)),
                                 },
                                 Err(_) => BatchResult {
                                     url,
                                     status: 0,
                                     title: String::new(),
+                                    extracted: None,
                                     error: Some("timeout after 60s".to_string()),
                                 },
                             }
@@ -168,6 +196,49 @@ impl Browser {
     /// Get the cookie jar
     pub fn cookies(&self) -> &Arc<Mutex<CookieJar>> {
         &self.cookies
+    }
+
+    /// 从页面提取内容（静态方法，在线程内调用）
+    fn extract_from_page_static(page: &mut Page, config: &ExtractionConfig) -> Option<String> {
+        // 优先执行 eval
+        if let Some(ref code) = config.eval {
+            match page.eval(code) {
+                Ok(result) => return Some(result),
+                Err(_) => return None,
+            }
+        }
+        // 其次执行 selector
+        if let Some(ref selector) = config.selector {
+            if config.select_all {
+                // --select-all: 返回所有匹配元素
+                let nodes = page.dom.query_selector_all(selector);
+                if nodes.is_empty() {
+                    return None;
+                }
+                let values: Vec<String> = nodes.iter().map(|&nid| {
+                    if let Some(ref attr_name) = config.attr {
+                        // 提取属性值
+                        mb_dom::element::get_attribute(&page.dom, nid, attr_name)
+                            .unwrap_or_default()
+                    } else {
+                        // 提取文本内容
+                        page.dom.text_content(nid)
+                    }
+                }).collect();
+                return Some(values.join("\n"));
+            } else {
+                // 单元素模式
+                if let Some(node_id) = page.dom.query_selector(selector) {
+                    if let Some(ref attr_name) = config.attr {
+                        return mb_dom::element::get_attribute(&page.dom, node_id, attr_name);
+                    } else {
+                        return Some(page.dom.text_content(node_id));
+                    }
+                }
+                return None;
+            }
+        }
+        None
     }
 }
 

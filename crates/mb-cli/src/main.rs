@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
 use mb_network::interceptor::RequestLog;
 
@@ -55,6 +56,22 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Custom HTTP header (可多次使用，格式: "Name: Value")
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
+
+        /// 选择所有匹配元素（配合 -s 使用，默认仅返回第一个）
+        #[arg(long)]
+        select_all: bool,
+
+        /// 提取匹配元素的指定属性值（配合 -s 使用）
+        #[arg(long)]
+        attr: Option<String>,
+
+        /// 输出 JSON 格式（便于 jq/管道处理）
+        #[arg(long)]
+        json: bool,
     },
 
     /// Replay previously recorded HTTP requests
@@ -91,7 +108,56 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Custom HTTP header (可多次使用，格式: "Name: Value")
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
+
+        /// 选择所有匹配元素（配合 -s 使用，默认仅返回第一个）
+        #[arg(long)]
+        select_all: bool,
+
+        /// 提取匹配元素的指定属性值（配合 -s 使用）
+        #[arg(long)]
+        attr: Option<String>,
+
+        /// 输出 JSON 格式（便于 jq/管道处理）
+        #[arg(long)]
+        json: bool,
     },
+}
+
+/// navigate --json 的输出结构
+#[derive(Serialize)]
+struct NavigateJsonOutput {
+    url: String,
+    status: u16,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+}
+
+/// 解析 "Name: Value" 格式的自定义 header
+fn parse_header(h: &str) -> Option<(&str, &str)> {
+    h.split_once(':').map(|(k, v)| (k.trim(), v.trim()))
+}
+
+/// 构建带自定义 headers 的 HttpRequest
+fn build_request_with_headers(
+    url: &str,
+    headers: &[String],
+) -> mb_network::HttpRequest {
+    let mut req = mb_network::HttpRequest::get(url)
+        .header("sec-fetch-user", "?1")
+        .header("upgrade-insecure-requests", "1");
+    for h in headers {
+        if let Some((k, v)) = parse_header(h) {
+            req = req.header(k, v);
+        }
+    }
+    req
 }
 
 #[tokio::main]
@@ -118,6 +184,10 @@ async fn main() -> Result<()> {
             record,
             record_full,
             verbose,
+            headers,
+            select_all,
+            attr,
+            json,
         } => {
             // Set up logging
             let level = if verbose { "debug" } else { "warn" };
@@ -155,38 +225,105 @@ async fn main() -> Result<()> {
                 mb_core::Browser::with_config(client_config)?
             };
 
-            let mut page = browser.navigate(&url).await?;
+            // 使用自定义 headers 导航
+            let mut page = if headers.is_empty() {
+                browser.navigate(&url).await?
+            } else {
+                // 通过手动构建 request + page 来支持自定义 headers
+                let mut p = browser.new_page();
+                let req = build_request_with_headers(&url, &headers);
+                p.navigate_with_request(req).await?;
+                p
+            };
 
-            // Output based on flags
-            if title || (!eval.is_some() && !selector.is_some() && !source && !dom) {
-                let t = page.dom_title();
-                if t.is_empty() {
-                    println!("(no title)");
-                } else {
-                    println!("{}", t);
+            // 收集提取结果
+            let mut extracted_value: Option<String> = None;
+
+            // --json 模式：收集所有信息后统一输出
+            if json {
+                let page_title = page.dom_title();
+                let page_status = page.status;
+
+                // 执行提取操作
+                if let Some(ref code) = eval {
+                    match page.eval(code) {
+                        Ok(result) => extracted_value = Some(result),
+                        Err(e) => eprintln!("JS error: {}", e),
+                    }
+                } else if let Some(ref sel) = selector {
+                    extracted_value = extract_from_dom(&page, sel, select_all, attr.as_deref());
                 }
-            }
 
-            if let Some(selector) = &selector {
-                match page.query_text(selector) {
-                    Some(text) => println!("{}", text),
-                    None => println!("(no match for '{}')", selector),
+                let output = NavigateJsonOutput {
+                    url: page.url.clone(),
+                    status: page_status,
+                    title: page_title,
+                    extracted: extracted_value,
+                    body: if source { Some(page.source().to_string()) } else { None },
+                };
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                // 非 JSON 模式：原有行为 + 新功能
+                if title || (!eval.is_some() && !selector.is_some() && !source && !dom) {
+                    let t = page.dom_title();
+                    if t.is_empty() {
+                        println!("(no title)");
+                    } else {
+                        println!("{}", t);
+                    }
                 }
-            }
 
-            if let Some(code) = &eval {
-                match page.eval(code) {
-                    Ok(result) => println!("{}", result),
-                    Err(e) => eprintln!("JS error: {}", e),
+                if let Some(ref sel) = selector {
+                    if select_all {
+                        // --select-all: 输出所有匹配元素，每行一个
+                        let nodes = page.dom.query_selector_all(sel);
+                        if nodes.is_empty() {
+                            println!("(no match for '{}')", sel);
+                        } else {
+                            for nid in &nodes {
+                                if let Some(ref attr_name) = attr {
+                                    let val = mb_dom::element::get_attribute(&page.dom, *nid, attr_name)
+                                        .unwrap_or_default();
+                                    println!("{}", val);
+                                } else {
+                                    println!("{}", page.dom.text_content(*nid));
+                                }
+                            }
+                        }
+                    } else {
+                        if let Some(ref attr_name) = attr {
+                            // 提取单个元素的属性值
+                            match page.dom.query_selector(sel) {
+                                Some(nid) => {
+                                    let val = mb_dom::element::get_attribute(&page.dom, nid, attr_name)
+                                        .unwrap_or_default();
+                                    println!("{}", val);
+                                }
+                                None => println!("(no match for '{}')", sel),
+                            }
+                        } else {
+                            match page.query_text(sel) {
+                                Some(text) => println!("{}", text),
+                                None => println!("(no match for '{}')", sel),
+                            }
+                        }
+                    }
                 }
-            }
 
-            if source {
-                println!("{}", page.source());
-            }
+                if let Some(ref code) = eval {
+                    match page.eval(code) {
+                        Ok(result) => println!("{}", result),
+                        Err(e) => eprintln!("JS error: {}", e),
+                    }
+                }
 
-            if dom {
-                print_dom_tree(page.dom(), page.dom().document_node, 0);
+                if source {
+                    println!("{}", page.source());
+                }
+
+                if dom {
+                    print_dom_tree(page.dom(), page.dom().document_node, 0);
+                }
             }
 
             // Save recorded requests if --record was specified
@@ -240,9 +377,13 @@ async fn main() -> Result<()> {
             urls,
             file,
             concurrency,
-            selector: _selector,
-            eval: _eval,
+            selector,
+            eval,
             verbose,
+            headers: _headers,
+            select_all,
+            attr,
+            json,
         } => {
             // Set up logging
             let level = if verbose { "debug" } else { "warn" };
@@ -284,19 +425,70 @@ async fn main() -> Result<()> {
 
             let browser = mb_core::Browser::with_config(client_config)?;
 
-            let results = browser.navigate_all(all_urls, concurrency).await;
+            // 构建提取配置
+            let extraction_config = if selector.is_some() || eval.is_some() {
+                Some(mb_core::ExtractionConfig {
+                    selector: selector.clone(),
+                    select_all,
+                    eval: eval.clone(),
+                    attr: attr.clone(),
+                })
+            } else {
+                None
+            };
 
-            for r in &results {
-                if let Some(ref err) = r.error {
-                    println!("{}\t\t0\tERROR: {}", r.url, err);
-                } else {
-                    println!("{}\t{}\t{}", r.url, r.title, r.status);
+            let results = browser.navigate_all(all_urls, concurrency, extraction_config).await;
+
+            if json {
+                // --json: 输出 JSON 数组
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                // 原有文本输出格式
+                for r in &results {
+                    if let Some(ref err) = r.error {
+                        println!("{}\t\t0\tERROR: {}", r.url, err);
+                    } else {
+                        let extracted_col = match &r.extracted {
+                            Some(val) => format!("\t{}", val.replace('\n', "\\n")),
+                            None => String::new(),
+                        };
+                        println!("{}\t{}{}{}", r.url, r.title, extracted_col, format!("\t{}", r.status));
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// 从页面 DOM 提取内容（供 navigate 命令使用）
+fn extract_from_dom(page: &mb_core::Page, selector: &str, select_all: bool, attr: Option<&str>) -> Option<String> {
+    if select_all {
+        let nodes = page.dom.query_selector_all(selector);
+        if nodes.is_empty() {
+            return None;
+        }
+        let values: Vec<String> = nodes.iter().map(|&nid| {
+            if let Some(attr_name) = attr {
+                mb_dom::element::get_attribute(&page.dom, nid, attr_name)
+                    .unwrap_or_default()
+            } else {
+                page.dom.text_content(nid)
+            }
+        }).collect();
+        Some(values.join("\n"))
+    } else {
+        if let Some(nid) = page.dom.query_selector(selector) {
+            if let Some(attr_name) = attr {
+                mb_dom::element::get_attribute(&page.dom, nid, attr_name)
+            } else {
+                Some(page.dom.text_content(nid))
+            }
+        } else {
+            None
+        }
+    }
 }
 
 /// Recursively print the DOM tree
